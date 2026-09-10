@@ -35,7 +35,6 @@ def fetch_auriga_schedule():
         )
         page = context.new_page()
 
-        # Listen for the planning API response emitted by Angular
         def handle_response(response):
             url = response.url
             if "/api/plannings/me" in url:
@@ -88,12 +87,12 @@ def fetch_auriga_schedule():
         except Exception:
             pass
 
-        # 4. Navigate into Planning module so Angular sets up tokens
+        # 4. Navigate into Planning module
         print(f"[INFO] Navigating to {PLANNING_URL}...")
         page.goto(PLANNING_URL, wait_until="networkidle")
         page.wait_for_timeout(4000)
 
-        # 5. Switch to Month View to trigger the monthly API payload
+        # 5. Switch to Month View
         try:
             month_btn = page.locator("button:has-text('Month'), button:has-text('Mois'), [aria-label*='Month'], [aria-label*='Mois']").first
             if month_btn.is_visible():
@@ -103,7 +102,7 @@ def fetch_auriga_schedule():
         except Exception:
             pass
 
-        # 6. Step through 4 months forward to trigger API requests for the full semester
+        # 6. Step forward month by month
         for i in range(4):
             print(f"[INFO] Requesting month #{i+1}...")
             page.wait_for_timeout(2500)
@@ -119,64 +118,113 @@ def fetch_auriga_schedule():
 
     return raw_interventions
 
+def parse_date_value(val):
+    if val is None:
+        return None
+    # Numeric timestamp (milliseconds or seconds)
+    if isinstance(val, (int, float)) or (isinstance(val, str) and val.isdigit()):
+        v = int(val)
+        if v > 1e11:  # milliseconds
+            return datetime.fromtimestamp(v / 1000, tz=PARIS_TZ)
+        return datetime.fromtimestamp(v, tz=PARIS_TZ)
+    # ISO string format
+    if isinstance(val, str):
+        cleaned = val.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(cleaned).astimezone(PARIS_TZ)
+        except Exception:
+            pass
+    return None
+
 def parse_api_event(item):
-    # 1. Title
-    course_obj = item.get("course") or item.get("subject") or {}
+    # 1. Inspect title from all common Auriga entity keys
     title = ""
-    if isinstance(course_obj, dict):
-        title = course_obj.get("caption", {}).get("en") or course_obj.get("caption", {}).get("fr") or course_obj.get("name", "")
-    
+    for k in ["course", "subject", "matter", "discipline", "module", "intervention"]:
+        sub = item.get(k)
+        if isinstance(sub, dict):
+            cap = sub.get("caption") or sub.get("name") or sub.get("label")
+            if isinstance(cap, dict):
+                title = cap.get("en") or cap.get("fr") or ""
+            elif isinstance(cap, str):
+                title = cap
+        elif isinstance(sub, str):
+            title = sub
+        if title:
+            break
+
     if not title:
-        act_type = item.get("activityType", {}).get("caption", {})
-        title = act_type.get("en") or act_type.get("fr") or item.get("name") or "Course"
+        act = item.get("activityType") or item.get("type") or {}
+        if isinstance(act, dict):
+            cap = act.get("caption") or act.get("name")
+            if isinstance(cap, dict):
+                title = cap.get("en") or cap.get("fr") or ""
+            elif isinstance(cap, str):
+                title = cap
+        elif isinstance(act, str):
+            title = act
 
-    # 2. Datetimes from API
-    start_str = item.get("startDate") or item.get("start")
-    end_str = item.get("endDate") or item.get("end")
+    if not title:
+        title = item.get("name") or item.get("title") or item.get("code") or "Course"
 
-    if not start_str:
+    # 2. Extract start and end datetimes across possible field names
+    start_dt = None
+    for k in ["start", "startDate", "startDateTime", "beginDate", "begin", "dateDebut", "debut"]:
+        if k in item and item[k] is not None:
+            start_dt = parse_date_value(item[k])
+            if start_dt:
+                break
+
+    end_dt = None
+    for k in ["end", "endDate", "endDateTime", "finishDate", "finish", "dateFin", "fin"]:
+        if k in item and item[k] is not None:
+            end_dt = parse_date_value(item[k])
+            if end_dt:
+                break
+
+    if not start_dt:
         return None
 
-    try:
-        start_dt = datetime.fromisoformat(str(start_str).replace("Z", "+00:00")).astimezone(PARIS_TZ)
-        if end_str:
-            end_dt = datetime.fromisoformat(str(end_str).replace("Z", "+00:00")).astimezone(PARIS_TZ)
-        else:
-            duration_sec = item.get("actualDuration", 7200)
-            end_dt = start_dt + timedelta(seconds=duration_sec)
-    except Exception:
-        return None
+    if not end_dt:
+        duration_sec = item.get("actualDuration") or item.get("duration") or 7200
+        end_dt = start_dt + timedelta(seconds=duration_sec)
 
-    # 3. Room
+    # 3. Extract room/location
     rooms = []
-    for r in item.get("rooms", []):
-        if isinstance(r, dict):
-            r_name = r.get("caption") or r.get("name") or r.get("code")
-            if r_name:
-                rooms.append(str(r_name))
-    location = " / ".join(rooms) if rooms else item.get("room", "")
+    r_list = item.get("rooms") or item.get("salles") or []
+    if isinstance(r_list, list):
+        for r in r_list:
+            if isinstance(r, dict):
+                r_name = r.get("caption") or r.get("name") or r.get("code")
+                if r_name:
+                    rooms.append(str(r_name))
+            elif isinstance(r, str):
+                rooms.append(r)
+    location = " / ".join(rooms) if rooms else str(item.get("room") or item.get("salle") or "")
 
-    # 4. Teacher
+    # 4. Extract teacher
     teachers = []
-    for t in item.get("teachers", []):
-        if isinstance(t, dict):
-            t_name = f"{t.get('firstName', '')} {t.get('lastName', '')}".strip() or t.get("name", "")
-            if t_name:
-                teachers.append(t_name)
+    t_list = item.get("teachers") or item.get("intervenants") or []
+    if isinstance(t_list, list):
+        for t in t_list:
+            if isinstance(t, dict):
+                name = f"{t.get('firstName', '')} {t.get('lastName', '')}".strip() or t.get("name", "")
+                if name:
+                    teachers.append(name)
+            elif isinstance(t, str):
+                teachers.append(t)
     teacher_str = ", ".join(teachers)
 
-    # 5. Description
+    # 5. Build description
     desc_lines = []
     if item.get("description"):
-        desc_lines.append(item["description"])
+        desc_lines.append(str(item["description"]))
     if teacher_str:
         desc_lines.append(f"Instructor: {teacher_str}")
     if location:
         desc_lines.append(f"Room: {location}")
 
-    # Unique ID per session
-    raw_id = f"auriga_{item.get('id', start_dt.strftime('%Y%m%d%H%M'))}"
-    clean_id = re.sub(r'[^a-zA-Z0-9]', '', raw_id)[:64]
+    item_id = item.get("id") or f"{title}_{start_dt.strftime('%Y%m%d%H%M')}"
+    clean_id = re.sub(r'[^a-zA-Z0-9]', '', f"auriga_{item_id}")[:64]
 
     return {
         "id": clean_id,
@@ -243,7 +291,7 @@ def sync_to_google(parsed_events):
             service.events().insert(calendarId=calendar_id, body=body).execute()
             print(f"[ADD] {body['summary']} ({item['start']['dateTime']}) - {body['location']}")
 
-    # Clean up any misplaced events from earlier DOM test runs
+    # Purge any misplaced/weekend events from earlier DOM scraper runs
     for auriga_id, g_event in existing_events.items():
         if auriga_id and auriga_id not in seen_ids:
             service.events().delete(calendarId=calendar_id, eventId=g_event["id"]).execute()
@@ -253,7 +301,7 @@ if __name__ == "__main__":
     raw_items = fetch_auriga_schedule()
     print(f"[INFO] Intercepted {len(raw_items)} total interventions.")
 
-    # Deduplicate by item id
+    # Deduplicate interventions by ID
     seen = set()
     unique_items = []
     for it in raw_items:
@@ -263,6 +311,11 @@ if __name__ == "__main__":
             unique_items.append(it)
         elif not it_id:
             unique_items.append(it)
+
+    if unique_items:
+        # Print first item keys to verify schema
+        sample = unique_items[0]
+        print(f"[SCHEMA DEBUG] Sample intervention keys: {list(sample.keys())}")
 
     valid_events = []
     for item in unique_items:
