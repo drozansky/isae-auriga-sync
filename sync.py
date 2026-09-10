@@ -8,6 +8,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 PARIS_TZ = pytz.timezone("Europe/Paris")
+PLANNING_URL = "https://auriga.isae-supaero.fr/#/mainContent/menuEntry/227/planning"
 
 def get_google_service():
     creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -23,7 +24,7 @@ def fetch_auriga_schedule():
     username = os.environ["SCHOOL_USERNAME"]
     password = os.environ["SCHOOL_PASSWORD"]
     
-    events = []
+    raw_interventions = []
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -34,10 +35,29 @@ def fetch_auriga_schedule():
         )
         page = context.new_page()
 
+        # Listen for the planning API response emitted by Angular
+        def handle_response(response):
+            url = response.url
+            if "/api/plannings/me" in url:
+                print(f"[API INTERCEPT] Caught response from: {url}")
+                try:
+                    data = response.json()
+                    if isinstance(data, dict) and "interventions" in data:
+                        items = data["interventions"]
+                        raw_interventions.extend(items)
+                        print(f"[API INTERCEPT] Added {len(items)} official interventions.")
+                    elif isinstance(data, list):
+                        raw_interventions.extend(data)
+                        print(f"[API INTERCEPT] Added {len(data)} list items.")
+                except Exception as e:
+                    print(f"[API WARN] Failed to parse JSON: {e}")
+
+        page.on("response", handle_response)
+
         print("[INFO] Navigating to Auriga...")
         page.goto("https://auriga.isae-supaero.fr", wait_until="networkidle")
 
-        # 1. SSO
+        # 1. SSO Click
         sso_btn = page.locator("text=/Connexion SSO|SSO|Authentification/i").first
         if sso_btn.is_visible():
             sso_btn.click()
@@ -65,47 +85,42 @@ def fetch_auriga_schedule():
                     opt.click()
                     page.wait_for_load_state("networkidle")
                     page.wait_for_timeout(2000)
-        except Exception as e:
-            print(f"[WARN] Language toggle: {e}")
+        except Exception:
+            pass
 
-        # 4. Query the Auriga planning API directly using the authenticated session
-        # Range: Start of semester to end of February
-        start_date = "2026-09-01"
-        end_date = "2027-02-28"
-        api_url = (
-            f"https://auriga.isae-supaero.fr/api/plannings/me?"
-            f"days=1&days=2&days=3&days=4&days=5&days=6&days=7&"
-            f"startDate={start_date}&endDate={end_date}"
-        )
+        # 4. Navigate into Planning module so Angular sets up tokens
+        print(f"[INFO] Navigating to {PLANNING_URL}...")
+        page.goto(PLANNING_URL, wait_until="networkidle")
+        page.wait_for_timeout(4000)
 
-        print(f"[INFO] Fetching full semester schedule from API: {api_url}")
-        response = page.evaluate(f"""
-            async () => {{
-                const res = await fetch('{api_url}', {{
-                    headers: {{
-                        'Accept': 'application/json',
-                        'Accept-Language': 'en-US,en;q=0.9'
-                    }}
-                }});
-                return await res.json();
-            }}
-        """)
+        # 5. Switch to Month View to trigger the monthly API payload
+        try:
+            month_btn = page.locator("button:has-text('Month'), button:has-text('Mois'), [aria-label*='Month'], [aria-label*='Mois']").first
+            if month_btn.is_visible():
+                print("[INFO] Switching to Month view...")
+                month_btn.click()
+                page.wait_for_timeout(3000)
+        except Exception:
+            pass
 
-        # Extract interventions list
-        if isinstance(response, dict) and "interventions" in response:
-            events = response["interventions"]
-        elif isinstance(response, list):
-            events = response
-        else:
-            print(f"[WARN] Unexpected API response keys: {list(response.keys()) if isinstance(response, dict) else type(response)}")
+        # 6. Step through 4 months forward to trigger API requests for the full semester
+        for i in range(4):
+            print(f"[INFO] Requesting month #{i+1}...")
+            page.wait_for_timeout(2500)
+            next_btn = page.locator("button:has-text('>'), [aria-label*='next'], [aria-label*='suivant'], .fc-next-button").first
+            if next_btn.is_visible():
+                next_btn.click()
+                page.wait_for_timeout(3000)
+            else:
+                break
 
-        print(f"[INFO] Received {len(events)} raw events from Auriga API.")
+        page.wait_for_timeout(3000)
         browser.close()
 
-    return events
+    return raw_interventions
 
 def parse_api_event(item):
-    # Extract title
+    # 1. Title
     course_obj = item.get("course") or item.get("subject") or {}
     title = ""
     if isinstance(course_obj, dict):
@@ -115,22 +130,24 @@ def parse_api_event(item):
         act_type = item.get("activityType", {}).get("caption", {})
         title = act_type.get("en") or act_type.get("fr") or item.get("name") or "Course"
 
-    # Extract start and end datetimes
+    # 2. Datetimes from API
     start_str = item.get("startDate") or item.get("start")
     end_str = item.get("endDate") or item.get("end")
 
     if not start_str:
         return None
 
-    # Parse ISO dates (e.g. '2026-09-22T09:15:00Z' or '2026-09-22T11:15:00+02:00')
-    start_dt = datetime.fromisoformat(str(start_str).replace("Z", "+00:00")).astimezone(PARIS_TZ)
-    if end_str:
-        end_dt = datetime.fromisoformat(str(end_str).replace("Z", "+00:00")).astimezone(PARIS_TZ)
-    else:
-        duration_sec = item.get("actualDuration", 7200)
-        end_dt = start_dt + timedelta(seconds=duration_sec)
+    try:
+        start_dt = datetime.fromisoformat(str(start_str).replace("Z", "+00:00")).astimezone(PARIS_TZ)
+        if end_str:
+            end_dt = datetime.fromisoformat(str(end_str).replace("Z", "+00:00")).astimezone(PARIS_TZ)
+        else:
+            duration_sec = item.get("actualDuration", 7200)
+            end_dt = start_dt + timedelta(seconds=duration_sec)
+    except Exception:
+        return None
 
-    # Extract room/location
+    # 3. Room
     rooms = []
     for r in item.get("rooms", []):
         if isinstance(r, dict):
@@ -139,7 +156,7 @@ def parse_api_event(item):
                 rooms.append(str(r_name))
     location = " / ".join(rooms) if rooms else item.get("room", "")
 
-    # Extract teacher
+    # 4. Teacher
     teachers = []
     for t in item.get("teachers", []):
         if isinstance(t, dict):
@@ -148,7 +165,7 @@ def parse_api_event(item):
                 teachers.append(t_name)
     teacher_str = ", ".join(teachers)
 
-    # Build description
+    # 5. Description
     desc_lines = []
     if item.get("description"):
         desc_lines.append(item["description"])
@@ -223,10 +240,10 @@ def sync_to_google(parsed_events):
                 service.events().patch(calendarId=calendar_id, eventId=curr["id"], body=body).execute()
                 print(f"[UPDATE] {body['summary']} ({item['start']['dateTime']})")
         else:
-            service.events().insert(calendarId=calendar_id, body=body).execute()
+            service.events().insert(calendarId=calendar_id, body=body=body).execute()
             print(f"[ADD] {body['summary']} ({item['start']['dateTime']}) - {body['location']}")
 
-    # Purge the previous incorrectly-dated events
+    # Clean up any misplaced events from earlier DOM test runs
     for auriga_id, g_event in existing_events.items():
         if auriga_id and auriga_id not in seen_ids:
             service.events().delete(calendarId=calendar_id, eventId=g_event["id"]).execute()
@@ -234,9 +251,21 @@ def sync_to_google(parsed_events):
 
 if __name__ == "__main__":
     raw_items = fetch_auriga_schedule()
+    print(f"[INFO] Intercepted {len(raw_items)} total interventions.")
+
+    # Deduplicate by item id
+    seen = set()
+    unique_items = []
+    for it in raw_items:
+        it_id = it.get("id")
+        if it_id and it_id not in seen:
+            seen.add(it_id)
+            unique_items.append(it)
+        elif not it_id:
+            unique_items.append(it)
+
     valid_events = []
-    
-    for item in raw_items:
+    for item in unique_items:
         evt = parse_api_event(item)
         if evt:
             valid_events.append(evt)
