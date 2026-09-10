@@ -3,8 +3,7 @@ import json
 import re
 from datetime import datetime, timedelta
 import pytz
-from icalendar import Calendar
-from auriga import extract_calendar
+from playwright.sync_api import sync_playwright
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -20,58 +19,108 @@ def get_google_service():
     )
     return build("calendar", "v3", credentials=creds)
 
-def fetch_and_parse_events():
+def fetch_auriga_schedule():
     username = os.environ["SCHOOL_USERNAME"]
     password = os.environ["SCHOOL_PASSWORD"]
-
-    ics_filename = "schedule.ics"
-    print("[INFO] Extracting timetable via auriga-extract...")
     
-    # Run the extraction library
-    extract_calendar(username, password, ics_filename)
+    events = []
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            locale="fr-FR", 
+            timezone_id="Europe/Paris",
+            viewport={"width": 1440, "height": 900}
+        )
+        page = context.new_page()
 
-    if not os.path.exists(ics_filename):
-        raise FileNotFoundError("Calendar file schedule.ics was not created.")
+        # Listen for PrimeFaces calendar schedule payloads
+        def handle_response(response):
+            if "Planning" in response.url or "schedule" in response.url:
+                try:
+                    text = response.text()
+                    if '"events"' in text or 'events:' in text:
+                        match = re.search(r'\{"events"\s*:\s*(\[.*?\])\}', text)
+                        if match:
+                            parsed = json.loads(match.group(1))
+                            events.extend(parsed)
+                            print(f"[INFO] Intercepted {len(parsed)} events in response.")
+                except Exception:
+                    pass
 
-    with open(ics_filename, "rb") as f:
-        cal = Calendar.from_ical(f.read())
+        page.on("response", handle_response)
 
-    parsed_events = []
+        print("[INFO] Navigating to Auriga landing page...")
+        page.goto("https://auriga.isae-supaero.fr", wait_until="networkidle")
 
-    for component in cal.walk():
-        if component.name == "VEVENT":
-            uid = str(component.get("uid", ""))
-            summary = str(component.get("summary", "Cours"))
-            description = str(component.get("description", ""))
-            location = str(component.get("location", ""))
+        # 1. Click SSO button if present on Auriga landing screen
+        sso_btn = page.locator("text=/Connexion SSO|SSO|Authentification/i").first
+        if sso_btn.is_visible():
+            print("[INFO] Clicking Auriga SSO button...")
+            sso_btn.click()
+            page.wait_for_load_state("networkidle")
 
-            # Parse start and end datetimes
-            dtstart = component.get("dtstart").dt
-            dtend = component.get("dtend").dt
+        # 2. Handle Eliot IDP login screen
+        print(f"[INFO] Current URL: {page.url}")
+        if "eliot.isae.fr" in page.url or page.locator("input[type='password']").count() > 0:
+            print("[INFO] Eliot IDP detected. Submitting login credentials...")
+            page.locator("input[type='text'], input[name*='username'], input[id*='username'], input[name='j_username']").first.fill(username)
+            page.locator("input[type='password'], input[name='j_password']").first.fill(password)
+            
+            # Click submit button
+            submit_btn = page.locator("button[type='submit'], input[type='submit'], button[name='_eventId_proceed']").first
+            submit_btn.click()
+            page.wait_for_load_state("networkidle")
+            print(f"[INFO] Post-login URL: {page.url}")
 
-            # Ensure localized to Paris timezone
-            if not hasattr(dtstart, "tzinfo") or dtstart.tzinfo is None:
-                dtstart = PARIS_TZ.localize(dtstart)
-            else:
-                dtstart = dtstart.astimezone(PARIS_TZ)
+        # 3. Direct navigation to the Planning page
+        print("[INFO] Navigating to Planning...")
+        page.goto("https://auriga.isae-supaero.fr/faces/Planning.xhtml", wait_until="networkidle")
 
-            if not hasattr(dtend, "tzinfo") or dtend.tzinfo is None:
-                dtend = PARIS_TZ.localize(dtend)
-            else:
-                dtend = dtend.astimezone(PARIS_TZ)
+        # Wait for the calendar widget to mount and load data
+        try:
+            page.wait_for_selector(".fc-view, .ui-schedule, div[id*='schedule']", timeout=10000)
+            print("[INFO] Calendar UI mounted.")
+        except Exception:
+            print("[WARN] Timed out waiting for schedule selector.")
+            page.screenshot(path="debug_screen.png")
 
-            event_id = uid if uid else f"{summary}_{dtstart.isoformat()}"
+        # Give PrimeFaces AJAX a few seconds to return all schedule events
+        page.wait_for_timeout(4000)
+        browser.close()
 
-            parsed_events.append({
-                "id": event_id,
-                "summary": summary,
-                "description": description,
-                "location": location,
-                "start": {"dateTime": dtstart.isoformat()},
-                "end": {"dateTime": dtend.isoformat()},
-            })
+    return events
 
-    return parsed_events
+def parse_event_details(raw_event):
+    title = raw_event.get("title", "Cours")
+    clean_title = re.sub(r"<br\s*/?>", " - ", title)
+    clean_title = re.sub(r"<.*?>", "", clean_title).strip()
+
+    start_raw = raw_event.get("start")
+    end_raw = raw_event.get("end")
+
+    if isinstance(start_raw, int) or (isinstance(start_raw, str) and start_raw.isdigit()):
+        start_dt = datetime.fromtimestamp(int(start_raw) / 1000, tz=PARIS_TZ)
+        end_dt = datetime.fromtimestamp(int(end_raw) / 1000, tz=PARIS_TZ)
+    else:
+        start_dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).astimezone(PARIS_TZ)
+        end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).astimezone(PARIS_TZ)
+
+    location = ""
+    loc_match = re.search(r"(?:Salle|Amphi|Room)\s*[:\-]?\s*([A-Za-z0-9\.\-]+)", clean_title, re.IGNORECASE)
+    if loc_match:
+        location = loc_match.group(0)
+
+    event_id = str(raw_event.get("id", f"{clean_title}_{start_dt.isoformat()}"))
+
+    return {
+        "id": event_id,
+        "summary": clean_title.split(" - ")[0] if " - " in clean_title else clean_title,
+        "description": clean_title,
+        "location": location,
+        "start": {"dateTime": start_dt.isoformat()},
+        "end": {"dateTime": end_dt.isoformat()},
+    }
 
 def sync_to_google(parsed_events):
     calendar_id = os.environ["CALENDAR_ID"]
@@ -117,28 +166,27 @@ def sync_to_google(parsed_events):
 
         if auriga_id in existing_events:
             curr = existing_events[auriga_id]
-            # Detect changes in schedule or room
             if (curr.get("summary") != body["summary"] or
                 curr.get("start", {}).get("dateTime") != body["start"]["dateTime"] or
                 curr.get("end", {}).get("dateTime") != body["end"]["dateTime"] or
                 curr.get("location") != body["location"]):
                 service.events().patch(calendarId=calendar_id, eventId=curr["id"], body=body).execute()
-                print(f"Updated: {body['summary']} ({item['start']['dateTime']})")
+                print(f"[UPDATE] {body['summary']} ({item['start']['dateTime']})")
         else:
             service.events().insert(calendarId=calendar_id, body=body).execute()
-            print(f"Added: {body['summary']} ({item['start']['dateTime']})")
+            print(f"[ADD] {body['summary']} ({item['start']['dateTime']})")
 
-    # Handle canceled classes
     for auriga_id, g_event in existing_events.items():
         if auriga_id and auriga_id not in seen_ids:
             start_iso = g_event.get("start", {}).get("dateTime")
             if start_iso and datetime.fromisoformat(start_iso) > now:
                 service.events().delete(calendarId=calendar_id, eventId=g_event["id"]).execute()
-                print(f"Removed canceled class: {g_event.get('summary')}")
+                print(f"[REMOVE] {g_event.get('summary')}")
 
 if __name__ == "__main__":
-    events = fetch_and_parse_events()
-    print(f"[INFO] Successfully parsed {len(events)} events.")
-    if events:
-        sync_to_google(events)
+    raw = fetch_auriga_schedule()
+    print(f"[INFO] Retrieved {len(raw)} events from Auriga.")
+    if raw:
+        formatted = [parse_event_details(e) for e in raw]
+        sync_to_google(formatted)
         print("[SUCCESS] Calendar sync complete.")

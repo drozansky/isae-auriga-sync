@@ -2,7 +2,7 @@ name: Auriga Timetable Sync
 
 on:
   schedule:
-    # Run every 2 hours from 06:00 to 20:00 UTC (08:00 to 22:00 CET/CEST), Monday to Friday
+    # Run every 2 hours from 06:00 to 20:00 UTC (08:00 to 22:00 CET), Monday to Friday
     - cron: '0 6-20/2 * * 1-5'
   workflow_dispatch:
 
@@ -20,7 +20,9 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
 
       - name: Run sync
         run: python sync.py
@@ -29,3 +31,11 @@ jobs:
           SCHOOL_PASSWORD: ${{ secrets.SCHOOL_PASSWORD }}
           CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Upload Debug Screenshot on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshot
+          path: debug_screen.png
+          if-no-files-found: ignore
