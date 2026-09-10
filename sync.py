@@ -1,7 +1,7 @@
 import os
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, date, time, timedelta
 import pytz
 from playwright.sync_api import sync_playwright
 from google.oauth2 import service_account
@@ -9,6 +9,11 @@ from googleapiclient.discovery import build
 
 PARIS_TZ = pytz.timezone("Europe/Paris")
 PLANNING_URL = "https://auriga.isae-supaero.fr/#/mainContent/menuEntry/227/planning"
+
+MONTH_NAMES = {
+    "jan": 1, "fév": 2, "fev": 2, "mar": 3, "avr": 4, "mai": 5, "juin": 6,
+    "juil": 7, "aoû": 8, "aou": 8, "sep": 9, "oct": 10, "nov": 11, "déc": 12, "dec": 12
+}
 
 def get_google_service():
     creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -20,50 +25,77 @@ def get_google_service():
     )
     return build("calendar", "v3", credentials=creds)
 
+def extract_cards_from_page(page):
+    """
+    Evaluates JavaScript in the browser to extract every <pl-planning-card-header>
+    and associates it with the date of its column or day container.
+    """
+    return page.evaluate("""
+        () => {
+            const results = [];
+            
+            // Find all planning card containers
+            const headers = document.querySelectorAll('pl-planning-card-header, .pl-planning-card--header');
+            
+            headers.forEach((headerEl) => {
+                const parent = headerEl.closest('div[class*="planning-card"], [class*="card"], li, td, div') || headerEl.parentElement;
+                
+                // 1. Title
+                const titleEl = headerEl.querySelector('.pl-planning-card--header--title--text, p, div');
+                const title = titleEl ? titleEl.innerText.trim() : 'Course';
+                
+                // 2. Time string (e.g., '09:00 - 12:15')
+                const timeEl = parent.querySelector('.pl-planning-card--content--time');
+                const timeText = timeEl ? timeEl.innerText.trim() : '';
+                
+                // 3. Room
+                const roomEl = parent.querySelector('.pl-planning-card--footer--left, [pl-planning-card-footer-left]');
+                const room = roomEl ? roomEl.innerText.trim() : '';
+                
+                // 4. Teacher
+                const teacherEl = parent.querySelector('.pl-planning-card--footer--right, [pl-planning-card-footer-right]');
+                const teacher = teacherEl ? teacherEl.innerText.trim() : '';
+                
+                // 5. Course Cohort/Group
+                const contentEl = parent.querySelector('.pl-planning-card--content');
+                const contentText = contentEl ? contentEl.innerText.replace(timeText, '').trim() : '';
+                
+                // 6. Find date context from parent column header
+                let dateStr = '';
+                let col = parent.closest('[class*="col"], [class*="day"], [class*="column"], td');
+                if (col) {
+                    const colHeader = col.querySelector('[class*="header"], [class*="date"], [class*="title"]') || col;
+                    dateStr = colHeader ? colHeader.innerText.slice(0, 50) : '';
+                }
+
+                results.push({
+                    title: title,
+                    time: timeText,
+                    room: room,
+                    teacher: teacher,
+                    content: contentText,
+                    dateContext: dateStr
+                });
+            });
+            
+            return results;
+        }
+    """)
+
 def fetch_auriga_schedule():
     username = os.environ["SCHOOL_USERNAME"]
     password = os.environ["SCHOOL_PASSWORD"]
     
-    extracted_events = []
+    raw_cards = []
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        # Set browser locale and Accept-Language to English
         context = browser.new_context(
             locale="en-US",
             timezone_id="Europe/Paris",
-            viewport={"width": 1600, "height": 1000},
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
+            viewport={"width": 1600, "height": 1000}
         )
         page = context.new_page()
-
-        # Listen for any background JSON payloads containing course data
-        def handle_response(response):
-            if any(ext in response.url for ext in [".js", ".css", ".png", ".svg", ".woff"]):
-                return
-            try:
-                ct = response.headers.get("content-type", "")
-                if "json" in ct:
-                    data = response.json()
-                    # Check for lists of event objects
-                    target_list = None
-                    if isinstance(data, list) and len(data) > 0:
-                        target_list = data
-                    elif isinstance(data, dict):
-                        for k in ["events", "data", "planning", "items"]:
-                            if k in data and isinstance(data[k], list):
-                                target_list = data[k]
-                                break
-                    
-                    if target_list:
-                        for item in target_list:
-                            if isinstance(item, dict) and ("start" in item or "title" in item or "debut" in item):
-                                extracted_events.append(item)
-                                print(f"[NET] Extracted event from API: {item.get('title') or item.get('name')}")
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
 
         print("[INFO] Navigating to Auriga...")
         page.goto("https://auriga.isae-supaero.fr", wait_until="networkidle")
@@ -83,108 +115,113 @@ def fetch_auriga_schedule():
             submit_btn.click()
             page.wait_for_load_state("networkidle")
 
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(2000)
 
-        # 3. Switch Language to English if toggle exists
+        # 3. Switch Language to English
+        print("[INFO] Checking language toggle...")
         try:
-            lang_btn = page.locator("button:has-text('EN'), a:has-text('EN'), [aria-label*='English'], [title*='English']").first
-            if lang_btn.is_visible():
-                print("[INFO] Switching interface language to English...")
-                lang_btn.click()
+            lang_toggle = page.locator("button:has-text('EN'), a:has-text('EN'), [aria-label*='English'], img[alt*='en'], img[alt*='English'], span:has-text('EN')").first
+            if lang_toggle.is_visible():
+                print("[INFO] Clicking English language toggle...")
+                lang_toggle.click()
                 page.wait_for_timeout(1500)
+        except Exception as e:
+            print(f"[WARN] Language toggle not clicked: {e}")
+
+        # 4. Open Planning view
+        print(f"[INFO] Navigating to {PLANNING_URL}...")
+        page.goto(PLANNING_URL, wait_until="networkidle")
+        page.wait_for_timeout(4000)
+
+        # Wait for the custom card elements to be present
+        try:
+            page.wait_for_selector("pl-planning-card-header, .pl-planning-card--header", timeout=12000)
+            print("[INFO] Found <pl-planning-card-header> in DOM.")
+        except Exception:
+            print("[WARN] Card selector timeout, proceeding with scan...")
+
+        # Switch to Month view if available to load more weeks at once
+        try:
+            month_btn = page.locator("button:has-text('Month'), button:has-text('Mois'), [aria-label*='Month'], [aria-label*='Mois']").first
+            if month_btn.is_visible():
+                print("[INFO] Switching to Month view...")
+                month_btn.click()
+                page.wait_for_timeout(3000)
         except Exception:
             pass
 
-        # 4. Open Planning view
-        print("[INFO] Opening Planning view...")
-        page.goto(PLANNING_URL, wait_until="networkidle")
-        page.wait_for_timeout(6000)
+        # Extract cards for the current view
+        cards_view1 = extract_cards_from_page(page)
+        raw_cards.extend(cards_view1)
+        print(f"[INFO] Extracted {len(cards_view1)} cards from current view.")
 
-        # 5. Extract colored event elements directly from the DOM
-        # Modern schedulers wrap colored cards in identifiable classes
-        print("[INFO] Scanning DOM for rendered colored boxes...")
-        cards = page.locator(
-            "[class*='event'], "
-            "[class*='fc-time-grid-event'], "
-            "[class*='planning-item'], "
-            "[class*='appointment'], "
-            "[style*='background-color']"
-        ).all()
-
-        dom_items = []
-        for card in cards:
-            try:
-                # Filter out tiny elements or background containers
-                box = card.bounding_box()
-                if not box or box["width"] < 40 or box["height"] < 20:
-                    continue
-                
-                text = card.inner_text().strip()
-                if text and len(text) > 3 and not any(skip in text for skip in ["Mon planning", "Planning", "Aujourd'hui", "Today", "Semaine", "Week"]):
-                    dom_items.append({
-                        "raw_text": text,
-                        "title": text.split("\n")[0],
-                        "details": text.replace("\n", " - ")
-                    })
-            except Exception:
-                pass
-
-        print(f"[DOM] Located {len(dom_items)} visible schedule cards.")
-
-        # If API interception didn't yield structured JSON, use DOM card text
-        if len(extracted_events) == 0 and len(dom_items) > 0:
-            print("[INFO] Using DOM card content for calendar sync.")
-            for idx, item in enumerate(dom_items):
-                extracted_events.append({
-                    "id": f"card_{idx}_{hash(item['details'])}",
-                    "title": item["title"],
-                    "description": item["details"],
-                    "dom_card": True
-                })
+        # Click the 'Next' arrow to fetch the following week/month as well
+        try:
+            next_btn = page.locator("button:has-text('>'), button[aria-label*='next'], button[aria-label*='suivant'], .fc-next-button, [class*='next']").first
+            if next_btn.is_visible():
+                print("[INFO] Clicking Next view arrow...")
+                next_btn.click()
+                page.wait_for_timeout(3000)
+                cards_view2 = extract_cards_from_page(page)
+                raw_cards.extend(cards_view2)
+                print(f"[INFO] Extracted {len(cards_view2)} additional cards from next view.")
+        except Exception as e:
+            print(f"[INFO] Next view skipped: {e}")
 
         page.screenshot(path="debug_screen.png")
         browser.close()
 
-    return extracted_events
+    return raw_cards
 
-def parse_event_details(raw_event):
-    title = raw_event.get("title", "Course")
-    desc = raw_event.get("description", raw_event.get("details", title))
-    clean_title = re.sub(r"<.*?>", "", str(title)).strip()
+def parse_card_to_event(card, fallback_date):
+    title = card.get("title", "Course")
+    time_str = card.get("time", "")
+    room = card.get("room", "")
+    teacher = card.get("teacher", "")
+    content = card.get("content", "")
+    date_ctx = card.get("dateContext", "")
 
-    start_raw = raw_event.get("start")
-    end_raw = raw_event.get("end")
+    # Attempt to extract explicit day/month from column context
+    event_date = fallback_date
+    date_match = re.search(r'(\d{1,2})[\s/\.-]+([a-zA-Zà-üÀ-Ü]{3,}|\d{1,2})', date_ctx)
+    if date_match:
+        try:
+            day = int(date_match.group(1))
+            month_token = date_match.group(2).lower()[:3]
+            month = MONTH_NAMES.get(month_token, int(month_token) if month_token.isdigit() else fallback_date.month)
+            year = fallback_date.year
+            event_date = date(year, month, day)
+        except Exception:
+            event_date = fallback_date
 
-    now = datetime.now(PARIS_TZ)
+    # Parse Start and End times from string (e.g., '09:00 - 12:15')
+    start_dt = PARIS_TZ.localize(datetime.combine(event_date, time(8, 0)))
+    end_dt = start_dt + timedelta(hours=2)
 
-    # Parse timestamps if present
-    if start_raw:
-        if isinstance(start_raw, int) or (isinstance(start_raw, str) and start_raw.isdigit()):
-            start_dt = datetime.fromtimestamp(int(start_raw) / 1000, tz=PARIS_TZ)
-            end_dt = datetime.fromtimestamp(int(end_raw) / 1000, tz=PARIS_TZ) if end_raw else start_dt + timedelta(hours=2)
-        else:
-            start_dt = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00")).astimezone(PARIS_TZ)
-            end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00")).astimezone(PARIS_TZ) if end_raw else start_dt + timedelta(hours=2)
-    else:
-        # Fallback for DOM cards without timestamps
-        start_dt = now
-        end_dt = now + timedelta(hours=2)
+    times = re.findall(r'(\d{1,2})[:h](\d{2})', time_str)
+    if len(times) >= 2:
+        sh, sm = int(times[0][0]), int(times[0][1])
+        eh, em = int(times[1][0]), int(times[1][1])
+        start_dt = PARIS_TZ.localize(datetime.combine(event_date, time(sh, sm)))
+        end_dt = PARIS_TZ.localize(datetime.combine(event_date, time(eh, em)))
 
-    # Extract room number (Salle / Room / Amphi)
-    location = ""
-    loc_match = re.search(r"(?:Room|Salle|Amphi)\s*[:\-]?\s*([A-Za-z0-9\.\-]+)", desc, re.IGNORECASE)
-    if loc_match:
-        location = loc_match.group(0)
+    description_parts = []
+    if content:
+        description_parts.append(content)
+    if teacher:
+        description_parts.append(f"Instructor: {teacher}")
+    if room:
+        description_parts.append(f"Room: {room}")
 
-    event_id = str(raw_event.get("id", f"{clean_title}_{start_dt.isoformat()}"))
+    uid = f"{title}_{start_dt.strftime('%Y%m%dT%H%M%S')}"
 
     return {
-        "id": event_id,
-        "summary": clean_title,
-        "description": desc,
-        "location": location,
+        "id": re.sub(r'[^a-zA-Z0-9]', '', uid)[:64],
+        "summary": title,
+        "description": "\n".join(description_parts),
+        "location": room,
         "start": {"dateTime": start_dt.isoformat()},
-        "end": {"dateTime": end_dt.isoformat()},
+        "end": {"dateTime": end_dt.isoformat()}
     }
 
 def sync_to_google(parsed_events):
@@ -195,7 +232,7 @@ def sync_to_google(parsed_events):
     time_min = (now - timedelta(days=7)).isoformat()
     time_max = (now + timedelta(days=60)).isoformat()
 
-    print("[INFO] Fetching current Google Calendar events...")
+    print("[INFO] Fetching existing Google Calendar items...")
     existing_call = service.events().list(
         calendarId=calendar_id,
         timeMin=time_min,
@@ -203,7 +240,7 @@ def sync_to_google(parsed_events):
         singleEvents=True,
         privateExtendedProperty="app=auriga_sync"
     ).execute()
-    
+
     existing_events = {
         item.get("extendedProperties", {}).get("private", {}).get("auriga_id"): item
         for item in existing_call.get("items", [])
@@ -234,17 +271,31 @@ def sync_to_google(parsed_events):
             if (curr.get("summary") != body["summary"] or
                 curr.get("start", {}).get("dateTime") != body["start"]["dateTime"] or
                 curr.get("end", {}).get("dateTime") != body["end"]["dateTime"] or
-                curr.get("location") != body["location"]):
+                curr.get("location") != body["location"] or
+                curr.get("description") != body["description"]):
                 service.events().patch(calendarId=calendar_id, eventId=curr["id"], body=body).execute()
-                print(f"[UPDATE] {body['summary']}")
+                print(f"[UPDATE] {body['summary']} ({item['start']['dateTime']})")
         else:
             service.events().insert(calendarId=calendar_id, body=body).execute()
-            print(f"[ADD] {body['summary']}")
+            print(f"[ADD] {body['summary']} ({item['start']['dateTime']}) - {body['location']}")
+
+    for auriga_id, g_event in existing_events.items():
+        if auriga_id and auriga_id not in seen_ids:
+            start_iso = g_event.get("start", {}).get("dateTime")
+            if start_iso and datetime.fromisoformat(start_iso) > now:
+                service.events().delete(calendarId=calendar_id, eventId=g_event["id"]).execute()
+                print(f"[REMOVE] {g_event.get('summary')}")
 
 if __name__ == "__main__":
-    raw = fetch_auriga_schedule()
-    print(f"[INFO] Retrieved {len(raw)} events.")
-    if raw:
-        formatted = [parse_event_details(e) for e in raw]
+    cards = fetch_auriga_schedule()
+    print(f"[INFO] Retrieved {len(cards)} card elements.")
+    if cards:
+        today = date.today()
+        formatted = []
+        for c in cards:
+            if c.get("title") and c.get("time"):
+                formatted.append(parse_card_to_event(c, today))
+        
+        print(f"[INFO] Parsed {len(formatted)} valid course sessions.")
         sync_to_google(formatted)
         print("[SUCCESS] Calendar sync complete.")
