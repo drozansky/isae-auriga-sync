@@ -11,9 +11,12 @@ PARIS_TZ = pytz.timezone("Europe/Paris")
 PLANNING_URL = "https://auriga.isae-supaero.fr/#/mainContent/menuEntry/227/planning"
 
 MONTH_NAMES = {
-    "jan": 1, "fév": 2, "fev": 2, "feb": 2, "mar": 3, "avr": 4, "apr": 4, 
-    "mai": 5, "may": 5, "juin": 6, "jun": 6, "juil": 7, "jul": 7, "aoû": 8, 
-    "aou": 8, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "déc": 12, "dec": 12
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4,
+    "juin": 6, "juillet": 7, "août": 8, "aout": 8, "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12
 }
 
 def get_google_service():
@@ -27,40 +30,57 @@ def get_google_service():
     return build("calendar", "v3", credentials=creds)
 
 def extract_cards_from_page(page):
+    """
+    Extracts each planning card along with its explicit day cell date or day number.
+    """
     return page.evaluate("""
         () => {
             const results = [];
+            
+            // Get view title (e.g. 'September 2026') to determine current month and year
+            const titleEl = document.querySelector('.fc-toolbar-title, [class*="calendar-title"], [class*="header-title"], h2');
+            const viewTitle = titleEl ? titleEl.innerText.trim() : '';
+
             const headers = document.querySelectorAll('pl-planning-card-header, .pl-planning-card--header');
             
             headers.forEach((headerEl) => {
-                const parent = headerEl.closest('div[class*="planning-card"], [class*="card"], li, td, div') || headerEl.parentElement;
+                const card = headerEl.closest('div[class*="planning-card"], [class*="card"], li, div') || headerEl.parentElement;
                 
-                // 1. Title
+                // Title
                 const titleEl = headerEl.querySelector('.pl-planning-card--header--title--text, p, div');
                 const title = titleEl ? titleEl.innerText.trim() : 'Course';
                 
-                // 2. Time string (e.g., '09:00 - 12:15')
-                const timeEl = parent.querySelector('.pl-planning-card--content--time');
-                let timeText = timeEl ? timeEl.innerText.trim() : '';
+                // Time
+                const timeEl = card.querySelector('.pl-planning-card--content--time');
+                const timeText = timeEl ? timeEl.innerText.trim() : '';
                 
-                // 3. Room
-                const roomEl = parent.querySelector('.pl-planning-card--footer--left, [pl-planning-card-footer-left]');
+                // Room
+                const roomEl = card.querySelector('.pl-planning-card--footer--left, [pl-planning-card-footer-left]');
                 const room = roomEl ? roomEl.innerText.trim() : '';
                 
-                // 4. Teacher
-                const teacherEl = parent.querySelector('.pl-planning-card--footer--right, [pl-planning-card-footer-right]');
+                // Teacher
+                const teacherEl = card.querySelector('.pl-planning-card--footer--right, [pl-planning-card-footer-right]');
                 const teacher = teacherEl ? teacherEl.innerText.trim() : '';
                 
-                // 5. Course Cohort/Group
-                const contentEl = parent.querySelector('.pl-planning-card--content');
-                let contentText = contentEl ? contentEl.innerText.replace(timeText, '').trim() : '';
+                // Track / Details
+                const contentEl = card.querySelector('.pl-planning-card--content');
+                const contentText = contentEl ? contentEl.innerText.replace(timeText, '').trim() : '';
+
+                // Find date from the enclosing cell
+                let dayNum = '';
+                let cellDateAttr = '';
                 
-                // 6. Find date context from parent column or day cell
-                let dateStr = '';
-                let col = parent.closest('[class*="col"], [class*="day"], [class*="column"], td, [class*="cell"]');
-                if (col) {
-                    const colHeader = col.querySelector('[class*="header"], [class*="date"], [class*="title"]') || col;
-                    dateStr = colHeader ? colHeader.innerText.slice(0, 50) : '';
+                // Look for common calendar day cell wrappers
+                const cell = card.closest('td, [class*="day-cell"], [class*="daygrid-day"], [class*="cell"]');
+                if (cell) {
+                    cellDateAttr = cell.getAttribute('data-date') || '';
+                    
+                    // Look for day number element inside this cell
+                    const dayEl = cell.querySelector('[class*="day-top"], [class*="day-number"], [class*="date"], a, span');
+                    if (dayEl) {
+                        const m = dayEl.innerText.match(/\\b(\\d{1,2})\\b/);
+                        if (m) dayNum = m[1];
+                    }
                 }
 
                 results.push({
@@ -69,8 +89,10 @@ def extract_cards_from_page(page):
                     room: room,
                     teacher: teacher,
                     content: contentText,
-                    dateContext: dateStr,
-                    fullText: parent.innerText
+                    fullText: card.innerText,
+                    dayNum: dayNum,
+                    cellDateAttr: cellDateAttr,
+                    viewTitle: viewTitle
                 });
             });
             
@@ -79,23 +101,20 @@ def extract_cards_from_page(page):
     """)
 
 def switch_language_to_english(page):
-    print("[INFO] Attempting to set language to English...")
+    print("[INFO] Setting language to English...")
     try:
-        # Match element containing 'Français' or 'Francais'
         lang_btn = page.locator("text=/Français|Francais/i").first
         if lang_btn.is_visible():
             lang_btn.click()
             page.wait_for_timeout(1000)
-            
-            # Select Anglais or English from the opened dropdown
             opt = page.locator("text=/Anglais|English/i").first
             if opt.is_visible():
-                print("[INFO] Selected 'Anglais' / 'English'.")
+                print("[INFO] Selected English.")
                 opt.click()
                 page.wait_for_load_state("networkidle")
                 page.wait_for_timeout(2000)
     except Exception as e:
-        print(f"[WARN] Language toggle skipped: {e}")
+        print(f"[WARN] Language toggle: {e}")
 
 def fetch_auriga_schedule():
     username = os.environ["SCHOOL_USERNAME"]
@@ -115,7 +134,7 @@ def fetch_auriga_schedule():
         print("[INFO] Navigating to Auriga...")
         page.goto("https://auriga.isae-supaero.fr", wait_until="networkidle")
 
-        # 1. SSO Click
+        # 1. SSO
         sso_btn = page.locator("text=/Connexion SSO|SSO|Authentification/i").first
         if sso_btn.is_visible():
             sso_btn.click()
@@ -132,7 +151,7 @@ def fetch_auriga_schedule():
 
         page.wait_for_timeout(2500)
 
-        # 3. Switch Language to English
+        # 3. Switch Language
         switch_language_to_english(page)
 
         # 4. Open Planning view
@@ -140,7 +159,7 @@ def fetch_auriga_schedule():
         page.goto(PLANNING_URL, wait_until="networkidle")
         page.wait_for_timeout(4000)
 
-        # 5. Switch to Month view
+        # 5. Month View
         try:
             month_btn = page.locator("button:has-text('Month'), button:has-text('Mois'), [aria-label*='Month'], [aria-label*='Mois']").first
             if month_btn.is_visible():
@@ -150,9 +169,8 @@ def fetch_auriga_schedule():
         except Exception:
             pass
 
-        # 6. Scrape across the current month and upcoming months
-        # We step forward month-by-month up to 4 times to pull the upcoming semester
-        months_to_scrape = 4
+        # 6. Scrape 5 consecutive months forward (covers full semester)
+        months_to_scrape = 5
         for i in range(months_to_scrape):
             print(f"[INFO] Scraping calendar view #{i+1}...")
             cards = extract_cards_from_page(page)
@@ -160,11 +178,10 @@ def fetch_auriga_schedule():
             print(f"[INFO] Collected {len(cards)} cards in view #{i+1}.")
 
             if i < months_to_scrape - 1:
-                # Find and click Next button ('>')
                 next_btn = page.locator("button:has-text('>'), [aria-label*='next'], [aria-label*='suivant'], .fc-next-button").first
                 if next_btn.is_visible():
                     next_btn.click()
-                    page.wait_for_timeout(2500)
+                    page.wait_for_timeout(3000)
                 else:
                     break
 
@@ -173,36 +190,52 @@ def fetch_auriga_schedule():
 
     return all_cards
 
-def parse_card_to_event(card, fallback_date):
+def parse_card_to_event(card, reference_date):
     title = card.get("title") or "Course"
-    full_text = card.get("fullText", "")
     time_str = card.get("time", "")
     room = card.get("room", "")
     teacher = card.get("teacher", "")
     content = card.get("content", "")
-    date_ctx = card.get("dateContext", "")
+    full_text = card.get("fullText", "")
+    day_num = card.get("dayNum", "")
+    cell_date_attr = card.get("cellDateAttr", "")
+    view_title = card.get("viewTitle", "").lower()
 
-    # Resolve date
-    event_date = fallback_date
-    date_search_text = f"{date_ctx} {full_text}"
-    date_match = re.search(r'(\d{1,2})[\s/\.-]+([a-zA-Zà-üÀ-Ü]{3,}|\d{1,2})', date_search_text)
-    if date_match:
+    # 1. Determine Date
+    event_date = reference_date
+
+    # Case A: Cell has explicit 'data-date="2026-09-14"'
+    if cell_date_attr and re.match(r'^\d{4}-\d{2}-\d{2}$', cell_date_attr):
         try:
-            day = int(date_match.group(1))
-            m_str = date_match.group(2).lower()[:3]
-            month = MONTH_NAMES.get(m_str, int(m_str) if m_str.isdigit() else fallback_date.month)
-            year = fallback_date.year
-            # Adjust year if rolling past December
-            if month < fallback_date.month and fallback_date.month >= 10:
-                year += 1
+            event_date = datetime.strptime(cell_date_attr, "%Y-%m-%d").date()
+        except Exception:
+            pass
+    # Case B: Combine day_num with viewTitle (e.g. 'September 2026')
+    elif day_num:
+        try:
+            day = int(day_num)
+            month = reference_date.month
+            year = reference_date.year
+            
+            # Extract month from viewTitle
+            for name, m_val in MONTH_NAMES.items():
+                if name in view_title:
+                    month = m_val
+                    break
+            
+            # Extract year from viewTitle
+            yr_match = re.search(r'\b(202\d)\b', view_title)
+            if yr_match:
+                year = int(yr_match.group(1))
+
             event_date = date(year, month, day)
         except Exception:
-            event_date = fallback_date
+            event_date = reference_date
 
-    # Resolve start and end times
-    time_search_text = f"{time_str} {full_text}"
-    times = re.findall(r'(\d{1,2})[:h](\d{2})', time_search_text)
-    
+    # 2. Determine Start & End Times (e.g., '09:00 - 12:15')
+    time_search = f"{time_str} {full_text}"
+    times = re.findall(r'(\d{1,2})[:h](\d{2})', time_search)
+
     if len(times) >= 2:
         sh, sm = int(times[0][0]), int(times[0][1])
         eh, em = int(times[1][0]), int(times[1][1])
@@ -212,6 +245,7 @@ def parse_card_to_event(card, fallback_date):
         start_dt = PARIS_TZ.localize(datetime.combine(event_date, time(9, 0)))
         end_dt = start_dt + timedelta(hours=2)
 
+    # 3. Description
     desc_lines = []
     if content:
         desc_lines.append(content)
@@ -220,7 +254,7 @@ def parse_card_to_event(card, fallback_date):
     if room:
         desc_lines.append(f"Room: {room}")
 
-    # Unique deterministic ID prevents duplicates when scraping overlapping months
+    # Unique UID based on Title, Start Time, and Room
     raw_uid = f"{title}_{start_dt.strftime('%Y%m%d%H%M')}_{room}"
     event_id = re.sub(r'[^a-zA-Z0-9]', '', raw_uid)[:64]
 
@@ -239,7 +273,7 @@ def sync_to_google(parsed_events):
 
     now = datetime.now(PARIS_TZ)
     time_min = (now - timedelta(days=7)).isoformat()
-    time_max = (now + timedelta(days=150)).isoformat()
+    time_max = (now + timedelta(days=180)).isoformat()
 
     print("[INFO] Fetching existing Google Calendar items...")
     existing_call = service.events().list(
@@ -288,6 +322,7 @@ def sync_to_google(parsed_events):
             service.events().insert(calendarId=calendar_id, body=body).execute()
             print(f"[ADD] {body['summary']} ({item['start']['dateTime']}) - {body['location']}")
 
+    # Clean up obsolete placeholder events from previous buggy runs
     for auriga_id, g_event in existing_events.items():
         if auriga_id and auriga_id not in seen_ids:
             start_iso = g_event.get("start", {}).get("dateTime")
@@ -297,21 +332,22 @@ def sync_to_google(parsed_events):
 
 if __name__ == "__main__":
     cards = fetch_auriga_schedule()
-    print(f"[INFO] Retrieved {len(cards)} total raw cards across views.")
-    
-    # Deduplicate raw cards by text and time
-    unique_cards = []
-    seen = set()
-    for c in cards:
-        sig = (c.get("title"), c.get("time"), c.get("room"), c.get("dateContext"))
-        if sig not in seen:
-            seen.add(sig)
-            unique_cards.append(c)
+    print(f"[INFO] Retrieved {len(cards)} total cards across views.")
 
     today = date.today()
-    formatted = [parse_card_to_event(c, today) for c in unique_cards if c.get("title")]
+    parsed_events = []
     
-    print(f"[INFO] Parsed {len(formatted)} unique course sessions.")
-    if formatted:
-        sync_to_google(formatted)
-        print("[SUCCESS] Full calendar sync complete.")
+    # Process cards and prevent duplicates across overlapping views
+    seen_events = set()
+    for c in cards:
+        if c.get("title") and len(c.get("title")) > 2:
+            evt = parse_card_to_event(c, today)
+            key = (evt["summary"], evt["start"]["dateTime"], evt["location"])
+            if key not in seen_events:
+                seen_events.add(key)
+                parsed_events.append(evt)
+
+    print(f"[INFO] Successfully parsed {len(parsed_events)} distinct class sessions.")
+    if parsed_events:
+        sync_to_google(parsed_events)
+        print("[SUCCESS] Full semester calendar sync complete.")
