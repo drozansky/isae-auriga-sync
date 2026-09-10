@@ -11,7 +11,6 @@ PARIS_TZ = pytz.timezone("Europe/Paris")
 PLANNING_URL = "https://auriga.isae-supaero.fr/#/mainContent/menuEntry/227/planning"
 
 # Google Calendar Event Palette (excludes Tomato Red "11" reserved for exams)
-# 1: Lavender, 2: Sage, 3: Grape, 4: Flamingo, 5: Banana, 6: Tangerine, 7: Peacock, 9: Blueberry, 10: Basil
 COURSE_PALETTE = ["1", "2", "3", "4", "5", "6", "7", "9", "10"]
 
 
@@ -27,13 +26,11 @@ def get_google_service():
 
 
 def get_event_color(summary, activity_name, is_exam=False):
-    # Always highlight exams, tests, or graded evaluations in Tomato Red ("11")
     exam_keywords = ["exam", "graded", "contrôle", "partiel", "devoir", "test"]
     text_to_check = f"{summary} {activity_name}".lower()
     if is_exam or any(k in text_to_check for k in exam_keywords):
         return "11"
 
-    # Assign a consistent, deterministic color to each course based on its name
     color_index = abs(hash(summary)) % len(COURSE_PALETTE)
     return COURSE_PALETTE[color_index]
 
@@ -68,23 +65,53 @@ def extract_caption(obj):
 
 def extract_person_name(obj):
     if not isinstance(obj, dict):
-        return str(obj) if obj else ""
+        return str(obj).strip() if obj else ""
 
     first = obj.get("firstName") or obj.get("prenom") or ""
     last = obj.get("lastName") or obj.get("nom") or ""
     if first or last:
         return f"{first} {last}".strip()
 
-    for key in ["person", "individual", "instructor", "intervenant", "user"]:
+    for k in ["fullName", "displayName", "name"]:
+        val = obj.get(k)
+        if isinstance(val, str) and len(val.strip()) > 1 and not val.strip().isdigit():
+            return val.strip()
+
+    for key in ["instructor", "individual", "person", "intervenant", "user", "participant"]:
         if key in obj and isinstance(obj[key], dict):
-            nested_name = extract_person_name(obj[key])
-            if nested_name:
-                return nested_name
+            res = extract_person_name(obj[key])
+            if res:
+                return res
 
     cap = extract_caption(obj)
-    if cap and not cap.isdigit() and len(cap) > 2:
+    if cap and not cap.isdigit() and len(cap) >= 2:
         return cap
+
     return ""
+
+
+def scrape_dom_card_metadata(page):
+    """Scrapes visible planning cards directly from the Angular DOM."""
+    return page.evaluate("""() => {
+        const cards = document.querySelectorAll('.pl-planning-card');
+        const results = [];
+        cards.forEach(card => {
+            const titleEl = card.querySelector('.pl-planning-card--header--title--text');
+            const timeEl = card.querySelector('.pl-planning-card--content--time');
+            const roomEl = card.querySelector('.pl-planning-card--footer--left p');
+            const teacherEl = card.querySelector('.pl-planning-card--footer--right p');
+            
+            const title = titleEl ? titleEl.innerText.trim() : '';
+            const time = timeEl ? timeEl.innerText.trim() : '';
+            const room = roomEl ? roomEl.innerText.trim() : '';
+            const teacher = teacherEl ? teacherEl.innerText.trim() : '';
+
+            if (title && (teacher || room)) {
+                results.push({ title, time, room, teacher });
+            }
+        });
+        return results;
+    }""")
 
 
 def fetch_auriga_schedule():
@@ -92,6 +119,7 @@ def fetch_auriga_schedule():
     password = os.environ["SCHOOL_PASSWORD"]
 
     raw_interventions = []
+    dom_metadata_map = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -102,15 +130,13 @@ def fetch_auriga_schedule():
         )
         page = context.new_page()
 
-        # Intercept backend timetable API payloads directly from Angular requests
         def handle_response(response):
             url = response.url
             if "/api/plannings/me" in url:
                 try:
                     data = response.json()
                     if isinstance(data, dict) and "interventions" in data:
-                        items = data["interventions"]
-                        raw_interventions.extend(items)
+                        raw_interventions.extend(data["interventions"])
                     elif isinstance(data, list):
                         raw_interventions.extend(data)
                 except Exception:
@@ -121,13 +147,13 @@ def fetch_auriga_schedule():
         print("[INFO] Navigating to Auriga...")
         page.goto("https://auriga.isae-supaero.fr", wait_until="networkidle")
 
-        # 1. SSO Button
+        # 1. SSO Click
         sso_btn = page.locator("text=/Connexion SSO|SSO|Authentification/i").first
         if sso_btn.is_visible():
             sso_btn.click()
             page.wait_for_load_state("networkidle")
 
-        # 2. Authenticate via Eliot Shibboleth IDP
+        # 2. Login via Eliot
         if "eliot.isae.fr" in page.url or page.locator("input[type='password']").count() > 0:
             print("[INFO] Logging into Eliot IDP...")
             page.locator(
@@ -158,12 +184,12 @@ def fetch_auriga_schedule():
         except Exception:
             pass
 
-        # 4. Open Planning view
+        # 4. Navigate into Planning module
         print(f"[INFO] Navigating to {PLANNING_URL}...")
         page.goto(PLANNING_URL, wait_until="networkidle")
         page.wait_for_timeout(3000)
 
-        # 5. Switch to Month View to request month-wide payloads
+        # 5. Switch to Month View
         try:
             month_btn = page.locator(
                 "button:has-text('Month'), button:has-text('Mois'), [aria-label*='Month'], [aria-label*='Mois']"
@@ -175,11 +201,23 @@ def fetch_auriga_schedule():
         except Exception:
             pass
 
-        # 6. Step forward 9 months to cover September 2026 through May 2027
+        # 6. Step forward 9 months and harvest DOM cards alongside API responses
         months_to_request = 9
         for i in range(months_to_request):
             print(f"[INFO] Fetching month #{i+1} of {months_to_request}...")
-            page.wait_for_timeout(600)
+            page.wait_for_timeout(700)
+
+            # Extract instructor cards visible in DOM for the current month view
+            try:
+                card_data = scrape_dom_card_metadata(page)
+                for item in card_data:
+                    start_time = item["time"].split("-")[0].strip() if "-" in item["time"] else item["time"].strip()
+                    key = f"{item['title'].lower()}_{start_time}"
+                    if item.get("teacher"):
+                        dom_metadata_map[key] = item["teacher"]
+            except Exception:
+                pass
+
             next_btn = page.locator(
                 "button:has-text('>'), [aria-label*='next'], [aria-label*='suivant'], .fc-next-button"
             ).first
@@ -192,10 +230,11 @@ def fetch_auriga_schedule():
         page.wait_for_timeout(1500)
         browser.close()
 
-    return raw_interventions
+    print(f"[INFO] Harvested {len(dom_metadata_map)} instructor mappings directly from DOM cards.")
+    return raw_interventions, dom_metadata_map
 
 
-def parse_api_event(item):
+def parse_api_event(item, dom_metadata_map):
     # 1. Course Name (Clean Title from Pedagogical Units)
     course_name = ""
     pus = item.get("interventionPedagogicalUnits") or []
@@ -207,7 +246,7 @@ def parse_api_event(item):
         if candidate and candidate not in course_name:
             course_name = candidate if not course_name else f"{course_name} · {candidate}"
 
-    # 2. Activity / Format (Lecture, Tutorials, Exam, etc.)
+    # 2. Activity / Format
     activity_name = extract_caption(item.get("activityType"))
 
     if course_name:
@@ -227,19 +266,23 @@ def parse_api_event(item):
         dur = item.get("actualDuration") or 7200
         end_dt = start_dt + timedelta(seconds=dur)
 
-    # 4. Rooms / Locations
+    # 4. Rooms and Instructors from Resources
     rooms = []
+    instructors = []
+
     res_list = item.get("interventionResources") or []
     for res in res_list:
         if isinstance(res, dict):
             r = res.get("resource") or res
             r_name = extract_caption(r)
-            if r_name and r_name not in rooms:
-                rooms.append(r_name)
-    location = " / ".join(rooms)
+            if re.search(r'\d', r_name) or "AMPHI" in r_name.upper():
+                if r_name not in rooms:
+                    rooms.append(r_name)
+            else:
+                if r_name and r_name not in instructors:
+                    instructors.append(r_name)
 
-    # 5. Instructors
-    instructors = []
+    # Check interventionInstructors and participations
     for inst in item.get("interventionInstructors") or []:
         name = extract_person_name(inst)
         if name and name not in instructors:
@@ -247,12 +290,19 @@ def parse_api_event(item):
 
     for part in item.get("participations") or []:
         if isinstance(part, dict):
-            role = str(part.get("role", "")).upper()
-            if any(k in role for k in ["TEACH", "ENS", "PROF", "INTERV"]) or not role:
-                name = extract_person_name(part)
-                if name and name not in instructors:
-                    instructors.append(name)
+            name = extract_person_name(part)
+            if name and name not in instructors:
+                instructors.append(name)
 
+    # 5. Reconcile with DOM metadata harvested from card footers
+    time_str = start_dt.strftime("%H:%M")
+    lookup_key = f"{summary.lower()}_{time_str}"
+    if lookup_key in dom_metadata_map:
+        dom_teacher = dom_metadata_map[lookup_key]
+        if dom_teacher and dom_teacher not in instructors:
+            instructors.append(dom_teacher)
+
+    location = " / ".join(rooms)
     instructor_str = ", ".join(instructors)
 
     # 6. Description / Notes
@@ -341,7 +391,6 @@ def sync_to_google(parsed_events):
             service.events().insert(calendarId=calendar_id, body=body).execute()
             print(f"[ADD] {body['summary']} ({item['start']['dateTime']}) - {body['location']}")
 
-    # Automatically delete cancelled or stale calendar entries
     for auriga_id, g_event in existing_events.items():
         if auriga_id and auriga_id not in seen_ids:
             service.events().delete(calendarId=calendar_id, eventId=g_event["id"]).execute()
@@ -349,10 +398,9 @@ def sync_to_google(parsed_events):
 
 
 if __name__ == "__main__":
-    raw_items = fetch_auriga_schedule()
+    raw_items, dom_metadata_map = fetch_auriga_schedule()
     print(f"[INFO] Intercepted {len(raw_items)} total interventions.")
 
-    # Deduplicate raw items by Auriga ID
     seen = set()
     unique_items = []
     for it in raw_items:
@@ -365,7 +413,7 @@ if __name__ == "__main__":
 
     valid_events = []
     for item in unique_items:
-        evt = parse_api_event(item)
+        evt = parse_api_event(item, dom_metadata_map)
         if evt:
             valid_events.append(evt)
 
