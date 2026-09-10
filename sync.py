@@ -38,25 +38,22 @@ def fetch_auriga_schedule():
         def handle_response(response):
             url = response.url
             if "/api/plannings/me" in url:
-                print(f"[API INTERCEPT] Caught response from: {url}")
                 try:
                     data = response.json()
                     if isinstance(data, dict) and "interventions" in data:
                         items = data["interventions"]
                         raw_interventions.extend(items)
-                        print(f"[API INTERCEPT] Added {len(items)} official interventions.")
                     elif isinstance(data, list):
                         raw_interventions.extend(data)
-                        print(f"[API INTERCEPT] Added {len(data)} list items.")
-                except Exception as e:
-                    print(f"[API WARN] Failed to parse JSON: {e}")
+                except Exception:
+                    pass
 
         page.on("response", handle_response)
 
         print("[INFO] Navigating to Auriga...")
         page.goto("https://auriga.isae-supaero.fr", wait_until="networkidle")
 
-        # 1. SSO
+        # 1. SSO Click
         sso_btn = page.locator("text=/Connexion SSO|SSO|Authentification/i").first
         if sso_btn.is_visible():
             sso_btn.click()
@@ -96,7 +93,6 @@ def fetch_auriga_schedule():
         try:
             month_btn = page.locator("button:has-text('Month'), button:has-text('Mois'), [aria-label*='Month'], [aria-label*='Mois']").first
             if month_btn.is_visible():
-                print("[INFO] Switching to Month view...")
                 month_btn.click()
                 page.wait_for_timeout(3000)
         except Exception:
@@ -105,7 +101,7 @@ def fetch_auriga_schedule():
         # 6. Step forward 9 months to cover September 2026 through May 2027
         months_to_request = 9
         for i in range(months_to_request):
-            print(f"[INFO] Requesting month #{i+1} of {months_to_request}...")
+            print(f"[INFO] Fetching month #{i+1} of {months_to_request}...")
             page.wait_for_timeout(2500)
             next_btn = page.locator("button:has-text('>'), [aria-label*='next'], [aria-label*='suivant'], .fc-next-button").first
             if next_btn.is_visible():
@@ -134,7 +130,7 @@ def parse_date_value(val):
 
 def extract_caption(obj):
     if isinstance(obj, dict):
-        cap = obj.get("caption") or obj.get("name") or obj.get("label")
+        cap = obj.get("caption") or obj.get("name") or obj.get("label") or obj.get("title")
         if isinstance(cap, dict):
             return cap.get("en") or cap.get("fr") or ""
         elif isinstance(cap, str):
@@ -145,8 +141,29 @@ def extract_caption(obj):
         return obj
     return ""
 
+def extract_person_name(obj):
+    """Recursively extracts a person's readable name from an Auriga entity object."""
+    if not isinstance(obj, dict):
+        return str(obj) if obj else ""
+    
+    first = obj.get("firstName") or obj.get("prenom") or ""
+    last = obj.get("lastName") or obj.get("nom") or ""
+    if first or last:
+        return f"{first} {last}".strip()
+
+    for key in ["person", "individual", "instructor", "intervenant", "user"]:
+        if key in obj and isinstance(obj[key], dict):
+            nested_name = extract_person_name(obj[key])
+            if nested_name:
+                return nested_name
+
+    cap = extract_caption(obj)
+    if cap and not cap.isdigit() and len(cap) > 2:
+        return cap
+    return ""
+
 def parse_api_event(item):
-    # 1. Course Title (extracted from interventionPedagogicalUnits)
+    # 1. Course Name (Clean Title)
     course_name = ""
     pus = item.get("interventionPedagogicalUnits") or []
     for pu in pus:
@@ -157,20 +174,18 @@ def parse_api_event(item):
         if candidate and candidate not in course_name:
             course_name = candidate if not course_name else f"{course_name} · {candidate}"
 
-    # 2. Activity / Type (e.g. Lecture, Tutorials, Exam)
+    # 2. Activity / Format (Lecture, Tutorial, Exam, etc.)
     activity_name = extract_caption(item.get("activityType"))
-    
-    # Compose final title: Course Name followed by Activity Type
-    if course_name and activity_name:
-        summary = f"{course_name} ({activity_name})"
-    elif course_name:
+
+    # Clean title without trailing '(Lecture)'
+    if course_name:
         summary = course_name
     elif activity_name:
         summary = activity_name
     else:
         summary = item.get("name") or "Course"
 
-    # 3. Datetimes (startDateTime and endDateTime)
+    # 3. Datetimes
     start_dt = parse_date_value(item.get("startDateTime") or item.get("startDate"))
     end_dt = parse_date_value(item.get("endDateTime") or item.get("endDate"))
 
@@ -180,7 +195,7 @@ def parse_api_event(item):
         dur = item.get("actualDuration") or 7200
         end_dt = start_dt + timedelta(seconds=dur)
 
-    # 4. Rooms / Locations (extracted from interventionResources)
+    # 4. Rooms / Locations
     rooms = []
     res_list = item.get("interventionResources") or []
     for res in res_list:
@@ -191,29 +206,37 @@ def parse_api_event(item):
                 rooms.append(r_name)
     location = " / ".join(rooms)
 
-    # 5. Instructors (extracted from interventionInstructors)
+    # 5. Instructors: check interventionInstructors, participations, and root fields
     instructors = []
-    inst_list = item.get("interventionInstructors") or []
-    for inst in inst_list:
-        if isinstance(inst, dict):
-            person = inst.get("instructor") or inst
-            first = person.get("firstName") or ""
-            last = person.get("lastName") or ""
-            full = f"{first} {last}".strip() or extract_caption(person)
-            if full and full not in instructors:
-                instructors.append(full)
+    
+    # Check interventionInstructors
+    for inst in item.get("interventionInstructors") or []:
+        name = extract_person_name(inst)
+        if name and name not in instructors:
+            instructors.append(name)
+            
+    # Check participations
+    for part in item.get("participations") or []:
+        if isinstance(part, dict):
+            role = str(part.get("role", "")).upper()
+            # If role indicates teacher or if no role specified
+            if any(k in role for k in ["TEACH", "ENS", "PROF", "INTERV"]) or not role:
+                name = extract_person_name(part)
+                if name and name not in instructors:
+                    instructors.append(name)
+
     instructor_str = ", ".join(instructors)
 
-    # 6. Description
+    # 6. Description / Notes
     desc_lines = []
-    if item.get("description"):
-        desc_lines.append(str(item["description"]))
-    if course_name and activity_name:
+    if activity_name:
         desc_lines.append(f"Format: {activity_name}")
     if instructor_str:
         desc_lines.append(f"Instructor: {instructor_str}")
     if location:
         desc_lines.append(f"Room: {location}")
+    if item.get("description") and item["description"] != activity_name:
+        desc_lines.append(f"Details: {item['description']}")
 
     item_id = str(item.get("id") or f"{summary}_{start_dt.strftime('%Y%m%d%H%M')}")
     clean_id = re.sub(r'[^a-zA-Z0-9]', '', f"auriga_{item_id}")[:64]
@@ -284,7 +307,6 @@ def sync_to_google(parsed_events):
             service.events().insert(calendarId=calendar_id, body=body).execute()
             print(f"[ADD] {body['summary']} ({item['start']['dateTime']}) - {body['location']}")
 
-    # Clean up any leftover generic placeholder entries
     for auriga_id, g_event in existing_events.items():
         if auriga_id and auriga_id not in seen_ids:
             service.events().delete(calendarId=calendar_id, eventId=g_event["id"]).execute()
@@ -294,7 +316,6 @@ if __name__ == "__main__":
     raw_items = fetch_auriga_schedule()
     print(f"[INFO] Intercepted {len(raw_items)} total interventions.")
 
-    # Deduplicate by API intervention ID
     seen = set()
     unique_items = []
     for it in raw_items:
@@ -314,4 +335,4 @@ if __name__ == "__main__":
     print(f"[INFO] Parsed {len(valid_events)} verified academic sessions.")
     if valid_events:
         sync_to_google(valid_events)
-        print("[SUCCESS] Full academic year (Sep 2026 - May 2027) sync complete.")
+        print("[SUCCESS] Calendar updated with clean titles and instructor notes.")
