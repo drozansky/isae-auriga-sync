@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          playwright install chromium --with-deps
+          playwright install chromium
 
       - name: Run sync
         run: python sync.py
@@ -32,8 +32,8 @@ jobs:
           CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
-      - name: Upload Debug Screenshot
-        if: always()
+      - name: Upload Debug Screenshot on Failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshot

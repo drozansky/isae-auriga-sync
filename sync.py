@@ -102,11 +102,11 @@ def fetch_auriga_schedule():
         months_to_request = 9
         for i in range(months_to_request):
             print(f"[INFO] Fetching month #{i+1} of {months_to_request}...")
-            page.wait_for_timeout(2500)
+            page.wait_for_timeout(600)
             next_btn = page.locator("button:has-text('>'), [aria-label*='next'], [aria-label*='suivant'], .fc-next-button").first
             if next_btn.is_visible():
                 next_btn.click()
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(800)
             else:
                 break
 
