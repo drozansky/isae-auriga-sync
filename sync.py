@@ -10,6 +10,11 @@ from googleapiclient.discovery import build
 PARIS_TZ = pytz.timezone("Europe/Paris")
 PLANNING_URL = "https://auriga.isae-supaero.fr/#/mainContent/menuEntry/227/planning"
 
+# Google Calendar Event Palette (excludes Tomato Red "11" reserved for exams)
+# 1: Lavender, 2: Sage, 3: Grape, 4: Flamingo, 5: Banana, 6: Tangerine, 7: Peacock, 9: Blueberry, 10: Basil
+COURSE_PALETTE = ["1", "2", "3", "4", "5", "6", "7", "9", "10"]
+
+
 def get_google_service():
     creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not creds_json:
@@ -20,12 +25,74 @@ def get_google_service():
     )
     return build("calendar", "v3", credentials=creds)
 
+
+def get_event_color(summary, activity_name, is_exam=False):
+    # Always highlight exams, tests, or graded evaluations in Tomato Red ("11")
+    exam_keywords = ["exam", "graded", "contrôle", "partiel", "devoir", "test"]
+    text_to_check = f"{summary} {activity_name}".lower()
+    if is_exam or any(k in text_to_check for k in exam_keywords):
+        return "11"
+
+    # Assign a consistent, deterministic color to each course based on its name
+    color_index = abs(hash(summary)) % len(COURSE_PALETTE)
+    return COURSE_PALETTE[color_index]
+
+
+def parse_date_value(val):
+    if val is None:
+        return None
+    if isinstance(val, (int, float)) or (isinstance(val, str) and val.isdigit()):
+        v = int(val)
+        return datetime.fromtimestamp((v / 1000) if v > 1e11 else v, tz=PARIS_TZ)
+    if isinstance(val, str):
+        try:
+            return datetime.fromisoformat(val.replace("Z", "+00:00")).astimezone(PARIS_TZ)
+        except Exception:
+            pass
+    return None
+
+
+def extract_caption(obj):
+    if isinstance(obj, dict):
+        cap = obj.get("caption") or obj.get("name") or obj.get("label") or obj.get("title")
+        if isinstance(cap, dict):
+            return cap.get("en") or cap.get("fr") or ""
+        elif isinstance(cap, str):
+            return cap
+        elif "code" in obj:
+            return str(obj["code"])
+    elif isinstance(obj, str):
+        return obj
+    return ""
+
+
+def extract_person_name(obj):
+    if not isinstance(obj, dict):
+        return str(obj) if obj else ""
+
+    first = obj.get("firstName") or obj.get("prenom") or ""
+    last = obj.get("lastName") or obj.get("nom") or ""
+    if first or last:
+        return f"{first} {last}".strip()
+
+    for key in ["person", "individual", "instructor", "intervenant", "user"]:
+        if key in obj and isinstance(obj[key], dict):
+            nested_name = extract_person_name(obj[key])
+            if nested_name:
+                return nested_name
+
+    cap = extract_caption(obj)
+    if cap and not cap.isdigit() and len(cap) > 2:
+        return cap
+    return ""
+
+
 def fetch_auriga_schedule():
     username = os.environ["SCHOOL_USERNAME"]
     password = os.environ["SCHOOL_PASSWORD"]
-    
+
     raw_interventions = []
-    
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -35,6 +102,7 @@ def fetch_auriga_schedule():
         )
         page = context.new_page()
 
+        # Intercept backend timetable API payloads directly from Angular requests
         def handle_response(response):
             url = response.url
             if "/api/plannings/me" in url:
@@ -53,48 +121,57 @@ def fetch_auriga_schedule():
         print("[INFO] Navigating to Auriga...")
         page.goto("https://auriga.isae-supaero.fr", wait_until="networkidle")
 
-        # 1. SSO Click
+        # 1. SSO Button
         sso_btn = page.locator("text=/Connexion SSO|SSO|Authentification/i").first
         if sso_btn.is_visible():
             sso_btn.click()
             page.wait_for_load_state("networkidle")
 
-        # 2. Login via Eliot
+        # 2. Authenticate via Eliot Shibboleth IDP
         if "eliot.isae.fr" in page.url or page.locator("input[type='password']").count() > 0:
             print("[INFO] Logging into Eliot IDP...")
-            page.locator("input[type='text'], input[name*='username'], input[id*='username'], input[name='j_username']").first.fill(username)
-            page.locator("input[type='password'], input[name='j_password']").first.fill(password)
-            submit_btn = page.locator("button[type='submit'], input[type='submit'], button[name='_eventId_proceed']").first
+            page.locator(
+                "input[type='text'], input[name*='username'], input[id*='username'], input[name='j_username']"
+            ).first.fill(username)
+            page.locator(
+                "input[type='password'], input[name='j_password']"
+            ).first.fill(password)
+            submit_btn = page.locator(
+                "button[type='submit'], input[type='submit'], button[name='_eventId_proceed']"
+            ).first
             submit_btn.click()
             page.wait_for_load_state("networkidle")
 
-        page.wait_for_timeout(2500)
+        page.wait_for_timeout(2000)
 
         # 3. Switch Language to English
         try:
             lang_btn = page.locator("text=/Français|Francais/i").first
             if lang_btn.is_visible():
                 lang_btn.click()
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(800)
                 opt = page.locator("text=/Anglais|English/i").first
                 if opt.is_visible():
                     opt.click()
                     page.wait_for_load_state("networkidle")
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(1500)
         except Exception:
             pass
 
-        # 4. Navigate into Planning module
+        # 4. Open Planning view
         print(f"[INFO] Navigating to {PLANNING_URL}...")
         page.goto(PLANNING_URL, wait_until="networkidle")
-        page.wait_for_timeout(4000)
+        page.wait_for_timeout(3000)
 
-        # 5. Switch to Month View
+        # 5. Switch to Month View to request month-wide payloads
         try:
-            month_btn = page.locator("button:has-text('Month'), button:has-text('Mois'), [aria-label*='Month'], [aria-label*='Mois']").first
+            month_btn = page.locator(
+                "button:has-text('Month'), button:has-text('Mois'), [aria-label*='Month'], [aria-label*='Mois']"
+            ).first
             if month_btn.is_visible():
+                print("[INFO] Switching to Month view...")
                 month_btn.click()
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(2000)
         except Exception:
             pass
 
@@ -103,67 +180,23 @@ def fetch_auriga_schedule():
         for i in range(months_to_request):
             print(f"[INFO] Fetching month #{i+1} of {months_to_request}...")
             page.wait_for_timeout(600)
-            next_btn = page.locator("button:has-text('>'), [aria-label*='next'], [aria-label*='suivant'], .fc-next-button").first
+            next_btn = page.locator(
+                "button:has-text('>'), [aria-label*='next'], [aria-label*='suivant'], .fc-next-button"
+            ).first
             if next_btn.is_visible():
                 next_btn.click()
                 page.wait_for_timeout(800)
             else:
                 break
 
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(1500)
         browser.close()
 
     return raw_interventions
 
-def parse_date_value(val):
-    if val is None:
-        return None
-    if isinstance(val, (int, float)) or (isinstance(val, str) and val.isdigit()):
-        v = int(val)
-        return datetime.fromtimestamp((v / 1000) if v > 1e11 else v, tz=PARIS_TZ)
-    if isinstance(val, str):
-        try:
-            return datetime.fromisoformat(val.replace("Z", "+00:00")).astimezone(PARIS_TZ)
-        except Exception:
-            pass
-    return None
-
-def extract_caption(obj):
-    if isinstance(obj, dict):
-        cap = obj.get("caption") or obj.get("name") or obj.get("label") or obj.get("title")
-        if isinstance(cap, dict):
-            return cap.get("en") or cap.get("fr") or ""
-        elif isinstance(cap, str):
-            return cap
-        elif "code" in obj:
-            return str(obj["code"])
-    elif isinstance(obj, str):
-        return obj
-    return ""
-
-def extract_person_name(obj):
-    """Recursively extracts a person's readable name from an Auriga entity object."""
-    if not isinstance(obj, dict):
-        return str(obj) if obj else ""
-    
-    first = obj.get("firstName") or obj.get("prenom") or ""
-    last = obj.get("lastName") or obj.get("nom") or ""
-    if first or last:
-        return f"{first} {last}".strip()
-
-    for key in ["person", "individual", "instructor", "intervenant", "user"]:
-        if key in obj and isinstance(obj[key], dict):
-            nested_name = extract_person_name(obj[key])
-            if nested_name:
-                return nested_name
-
-    cap = extract_caption(obj)
-    if cap and not cap.isdigit() and len(cap) > 2:
-        return cap
-    return ""
 
 def parse_api_event(item):
-    # 1. Course Name (Clean Title)
+    # 1. Course Name (Clean Title from Pedagogical Units)
     course_name = ""
     pus = item.get("interventionPedagogicalUnits") or []
     for pu in pus:
@@ -174,10 +207,9 @@ def parse_api_event(item):
         if candidate and candidate not in course_name:
             course_name = candidate if not course_name else f"{course_name} · {candidate}"
 
-    # 2. Activity / Format (Lecture, Tutorial, Exam, etc.)
+    # 2. Activity / Format (Lecture, Tutorials, Exam, etc.)
     activity_name = extract_caption(item.get("activityType"))
 
-    # Clean title without trailing '(Lecture)'
     if course_name:
         summary = course_name
     elif activity_name:
@@ -206,20 +238,16 @@ def parse_api_event(item):
                 rooms.append(r_name)
     location = " / ".join(rooms)
 
-    # 5. Instructors: check interventionInstructors, participations, and root fields
+    # 5. Instructors
     instructors = []
-    
-    # Check interventionInstructors
     for inst in item.get("interventionInstructors") or []:
         name = extract_person_name(inst)
         if name and name not in instructors:
             instructors.append(name)
-            
-    # Check participations
+
     for part in item.get("participations") or []:
         if isinstance(part, dict):
             role = str(part.get("role", "")).upper()
-            # If role indicates teacher or if no role specified
             if any(k in role for k in ["TEACH", "ENS", "PROF", "INTERV"]) or not role:
                 name = extract_person_name(part)
                 if name and name not in instructors:
@@ -238,17 +266,22 @@ def parse_api_event(item):
     if item.get("description") and item["description"] != activity_name:
         desc_lines.append(f"Details: {item['description']}")
 
+    # 7. Unique ID & Color
     item_id = str(item.get("id") or f"{summary}_{start_dt.strftime('%Y%m%d%H%M')}")
-    clean_id = re.sub(r'[^a-zA-Z0-9]', '', f"auriga_{item_id}")[:64]
+    clean_id = re.sub(r"[^a-zA-Z0-9]", "", f"auriga_{item_id}")[:64]
+    is_exam_flag = bool(item.get("isExam"))
+    event_color = get_event_color(summary, activity_name, is_exam=is_exam_flag)
 
     return {
         "id": clean_id,
         "summary": summary,
         "description": "\n".join(desc_lines),
         "location": location,
+        "colorId": event_color,
         "start": {"dateTime": start_dt.isoformat()},
         "end": {"dateTime": end_dt.isoformat()}
     }
+
 
 def sync_to_google(parsed_events):
     calendar_id = os.environ["CALENDAR_ID"]
@@ -256,7 +289,6 @@ def sync_to_google(parsed_events):
 
     now = datetime.now(PARIS_TZ)
     time_min = (now - timedelta(days=14)).isoformat()
-    # Query all events through end of May 2027
     time_max = (now + timedelta(days=300)).isoformat()
 
     print("[INFO] Fetching existing Google Calendar items...")
@@ -284,6 +316,7 @@ def sync_to_google(parsed_events):
             "summary": item["summary"],
             "description": item["description"],
             "location": item["location"],
+            "colorId": item["colorId"],
             "start": item["start"],
             "end": item["end"],
             "extendedProperties": {
@@ -300,22 +333,26 @@ def sync_to_google(parsed_events):
                 curr.get("start", {}).get("dateTime") != body["start"]["dateTime"] or
                 curr.get("end", {}).get("dateTime") != body["end"]["dateTime"] or
                 curr.get("location") != body["location"] or
-                curr.get("description") != body["description"]):
+                curr.get("description") != body["description"] or
+                curr.get("colorId") != body["colorId"]):
                 service.events().patch(calendarId=calendar_id, eventId=curr["id"], body=body).execute()
                 print(f"[UPDATE] {body['summary']} ({item['start']['dateTime']})")
         else:
             service.events().insert(calendarId=calendar_id, body=body).execute()
             print(f"[ADD] {body['summary']} ({item['start']['dateTime']}) - {body['location']}")
 
+    # Automatically delete cancelled or stale calendar entries
     for auriga_id, g_event in existing_events.items():
         if auriga_id and auriga_id not in seen_ids:
             service.events().delete(calendarId=calendar_id, eventId=g_event["id"]).execute()
             print(f"[PURGE OBSOLETE] {g_event.get('summary')} ({g_event.get('start', {}).get('dateTime')})")
 
+
 if __name__ == "__main__":
     raw_items = fetch_auriga_schedule()
     print(f"[INFO] Intercepted {len(raw_items)} total interventions.")
 
+    # Deduplicate raw items by Auriga ID
     seen = set()
     unique_items = []
     for it in raw_items:
@@ -335,4 +372,4 @@ if __name__ == "__main__":
     print(f"[INFO] Parsed {len(valid_events)} verified academic sessions.")
     if valid_events:
         sync_to_google(valid_events)
-        print("[SUCCESS] Calendar updated with clean titles and instructor notes.")
+        print("[SUCCESS] Calendar sync complete.")
