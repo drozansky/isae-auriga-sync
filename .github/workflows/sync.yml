@@ -4,7 +4,7 @@ on:
   schedule:
     # Run every 2 hours from 06:00 to 20:00 UTC (08:00 to 22:00 CET/CEST), Monday to Friday
     - cron: '0 6-20/2 * * 1-5'
-  workflow_dispatch: # Allows manual trigger anytime from GitHub UI
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -20,9 +20,7 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          playwright install chromium --with-deps
+        run: pip install -r requirements.txt
 
       - name: Run sync
         run: python sync.py
