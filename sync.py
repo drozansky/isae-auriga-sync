@@ -10,9 +10,6 @@ from googleapiclient.discovery import build
 PARIS_TZ = pytz.timezone("Europe/Paris")
 PLANNING_URL = "https://auriga.isae-supaero.fr/#/mainContent/menuEntry/227/planning"
 
-# Google Calendar Event Palette (excludes Tomato Red "11" reserved for exams)
-COURSE_PALETTE = ["1", "2", "3", "4", "5", "6", "7", "9", "10"]
-
 
 def get_google_service():
     creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -25,14 +22,47 @@ def get_google_service():
     return build("calendar", "v3", credentials=creds)
 
 
+import hashlib
+
+# Fixed, unique color assignments per subject (zero collisions, 100% deterministic)
+EXPLICIT_COURSE_COLORS = {
+    "aocs": "9",           # Blueberry (Dark Blue)
+    "propulsion": "6",     # Tangerine (Orange)
+    "law": "3",            # Grape (Deep Purple)
+    "environment": "2",    # Sage (Light Green)
+    "launcher": "10",      # Basil (Deep Forest Green)
+    "thermal": "7",        # Peacock (Cyan / Light Blue)
+    "data handling": "4",  # Flamingo (Coral / Pink)
+    "obdh": "4",           # Flamingo
+    "communication": "5",  # Banana (Yellow)
+    "french": "1",         # Lavender (Light Violet)
+    "fle": "1",            # Lavender
+    "estimation": "1",     # Lavender (re-used for Spring semester course)
+    "situational": "7",    # Peacock
+}
+
+FALLBACK_PALETTE = ["1", "2", "3", "4", "5", "6", "7", "9", "10"]
+
 def get_event_color(summary, activity_name, is_exam=False):
+    text = f"{summary} {activity_name}".lower()
+
+    # 1. Exams, graded tests, or evaluations always Tomato Red ("11")
     exam_keywords = ["exam", "graded", "contrôle", "partiel", "devoir", "test"]
-    text_to_check = f"{summary} {activity_name}".lower()
-    if is_exam or any(k in text_to_check for k in exam_keywords):
+    if is_exam or any(k in text for k in exam_keywords):
         return "11"
 
-    color_index = abs(hash(summary)) % len(COURSE_PALETTE)
-    return COURSE_PALETTE[color_index]
+    # 2. Autonomous work or generic presentations get muted Graphite Gray ("8")
+    if any(k in text for k in ["autonomie", "presentation", "présentation"]):
+        return "8"
+
+    # 3. Match explicit course keywords
+    for keyword, color_id in EXPLICIT_COURSE_COLORS.items():
+        if keyword in text:
+            return color_id
+
+    # 4. Deterministic fallback using MD5 (stable across all Python runs/machines)
+    hash_val = int(hashlib.md5(summary.encode("utf-8")).hexdigest(), 16)
+    return FALLBACK_PALETTE[hash_val % len(FALLBACK_PALETTE)]
 
 
 def parse_date_value(val):
