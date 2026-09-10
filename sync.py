@@ -30,57 +30,74 @@ def get_google_service():
     return build("calendar", "v3", credentials=creds)
 
 def extract_cards_from_page(page):
-    """
-    Extracts each planning card along with its explicit day cell date or day number.
-    """
     return page.evaluate("""
         () => {
             const results = [];
             
-            // Get view title (e.g. 'September 2026') to determine current month and year
-            const titleEl = document.querySelector('.fc-toolbar-title, [class*="calendar-title"], [class*="header-title"], h2');
-            const viewTitle = titleEl ? titleEl.innerText.trim() : '';
+            // Try to find the calendar title (e.g. September 2026)
+            let viewTitle = '';
+            const allHeadings = Array.from(document.querySelectorAll('h1, h2, h3, div, span, p'));
+            for (let el of allHeadings) {
+                const txt = el.innerText.trim();
+                if (/^(January|February|March|April|May|June|July|August|September|October|November|December|Janvier|Février|Mars|Avril|Mai|Juin|Juillet|Août|Septembre|Octobre|Novembre|Décembre)\\s+202\\d$/i.test(txt)) {
+                    viewTitle = txt;
+                    break;
+                }
+            }
 
             const headers = document.querySelectorAll('pl-planning-card-header, .pl-planning-card--header');
             
             headers.forEach((headerEl) => {
-                const card = headerEl.closest('div[class*="planning-card"], [class*="card"], li, div') || headerEl.parentElement;
+                // Ascend to the card container
+                let card = headerEl;
+                while (card && !card.classList.contains('pl-planning-card') && card.parentElement && card.parentElement !== document.body) {
+                    card = card.parentElement;
+                }
                 
                 // Title
                 const titleEl = headerEl.querySelector('.pl-planning-card--header--title--text, p, div');
                 const title = titleEl ? titleEl.innerText.trim() : 'Course';
                 
                 // Time
-                const timeEl = card.querySelector('.pl-planning-card--content--time');
+                const timeEl = card ? card.querySelector('.pl-planning-card--content--time') : null;
                 const timeText = timeEl ? timeEl.innerText.trim() : '';
                 
                 // Room
-                const roomEl = card.querySelector('.pl-planning-card--footer--left, [pl-planning-card-footer-left]');
+                const roomEl = card ? card.querySelector('.pl-planning-card--footer--left, [pl-planning-card-footer-left]') : null;
                 const room = roomEl ? roomEl.innerText.trim() : '';
                 
                 // Teacher
-                const teacherEl = card.querySelector('.pl-planning-card--footer--right, [pl-planning-card-footer-right]');
+                const teacherEl = card ? card.querySelector('.pl-planning-card--footer--right, [pl-planning-card-footer-right]') : null;
                 const teacher = teacherEl ? teacherEl.innerText.trim() : '';
                 
-                // Track / Details
-                const contentEl = card.querySelector('.pl-planning-card--content');
+                // Content
+                const contentEl = card ? card.querySelector('.pl-planning-card--content') : null;
                 const contentText = contentEl ? contentEl.innerText.replace(timeText, '').trim() : '';
 
-                // Find date from the enclosing cell
-                let dayNum = '';
-                let cellDateAttr = '';
-                
-                // Look for common calendar day cell wrappers
-                const cell = card.closest('td, [class*="day-cell"], [class*="daygrid-day"], [class*="cell"]');
-                if (cell) {
-                    cellDateAttr = cell.getAttribute('data-date') || '';
-                    
-                    // Look for day number element inside this cell
-                    const dayEl = cell.querySelector('[class*="day-top"], [class*="day-number"], [class*="date"], a, span');
-                    if (dayEl) {
-                        const m = dayEl.innerText.match(/\\b(\\d{1,2})\\b/);
-                        if (m) dayNum = m[1];
+                // Find date by climbing up the tree to inspect parents and siblings
+                let extractedDate = '';
+                let curr = card;
+                for (let i = 0; i < 8 && curr; i++) {
+                    // Check attributes for date
+                    for (let attr of curr.getAttributeNames()) {
+                        const val = curr.getAttribute(attr);
+                        if (/\\d{4}-\\d{2}-\\d{2}/.test(val)) {
+                            extractedDate = val.match(/\\d{4}-\\d{2}-\\d{2}/)[0];
+                            break;
+                        }
                     }
+                    if (extractedDate) break;
+
+                    // Check if parent contains a day-number or date indicator
+                    const dayCandidate = curr.querySelector('[class*="date"], [class*="day"], [class*="number"], [class*="header"]');
+                    if (dayCandidate && dayCandidate !== curr && /\\b(\\d{1,2})\\b/.test(dayCandidate.innerText)) {
+                        const m = dayCandidate.innerText.match(/\\b(\\d{1,2})\\b/);
+                        if (m && parseInt(m[1]) <= 31) {
+                            extractedDate = m[1];
+                        }
+                    }
+
+                    curr = curr.parentElement;
                 }
 
                 results.push({
@@ -89,9 +106,8 @@ def extract_cards_from_page(page):
                     room: room,
                     teacher: teacher,
                     content: contentText,
-                    fullText: card.innerText,
-                    dayNum: dayNum,
-                    cellDateAttr: cellDateAttr,
+                    fullText: card ? card.innerText : '',
+                    extractedDate: extractedDate,
                     viewTitle: viewTitle
                 });
             });
@@ -131,6 +147,23 @@ def fetch_auriga_schedule():
         )
         page = context.new_page()
 
+        # Listen for any JSON responses that contain event data
+        def handle_response(response):
+            try:
+                ct = response.headers.get("content-type", "")
+                if "json" in ct and not any(ext in response.url for ext in [".js", ".css"]):
+                    text = response.text()
+                    if "Space" in text or "start" in text or "debut" in text:
+                        print(f"[API SNIFF] Potential calendar payload from: {response.url[:120]}")
+                        # Print preview of the JSON structure
+                        data = response.json()
+                        preview = str(data)[:200]
+                        print(f"[API DATA PREVIEW] {preview}")
+            except Exception:
+                pass
+
+        page.on("response", handle_response)
+
         print("[INFO] Navigating to Auriga...")
         page.goto("https://auriga.isae-supaero.fr", wait_until="networkidle")
 
@@ -169,7 +202,7 @@ def fetch_auriga_schedule():
         except Exception:
             pass
 
-        # 6. Scrape 5 consecutive months forward (covers full semester)
+        # 6. Scrape across views
         months_to_scrape = 5
         for i in range(months_to_scrape):
             print(f"[INFO] Scraping calendar view #{i+1}...")
@@ -197,42 +230,37 @@ def parse_card_to_event(card, reference_date):
     teacher = card.get("teacher", "")
     content = card.get("content", "")
     full_text = card.get("fullText", "")
-    day_num = card.get("dayNum", "")
-    cell_date_attr = card.get("cellDateAttr", "")
+    extracted_date = card.get("extractedDate", "")
     view_title = card.get("viewTitle", "").lower()
 
-    # 1. Determine Date
-    event_date = reference_date
+    # Determine year & month from viewTitle
+    current_year = reference_date.year
+    current_month = reference_date.month
 
-    # Case A: Cell has explicit 'data-date="2026-09-14"'
-    if cell_date_attr and re.match(r'^\d{4}-\d{2}-\d{2}$', cell_date_attr):
+    for name, m_val in MONTH_NAMES.items():
+        if name in view_title:
+            current_month = m_val
+            break
+
+    yr_match = re.search(r'\b(202\d)\b', view_title)
+    if yr_match:
+        current_year = int(yr_match.group(1))
+
+    # Resolve date
+    event_date = reference_date
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', extracted_date):
         try:
-            event_date = datetime.strptime(cell_date_attr, "%Y-%m-%d").date()
+            event_date = datetime.strptime(extracted_date, "%Y-%m-%d").date()
         except Exception:
             pass
-    # Case B: Combine day_num with viewTitle (e.g. 'September 2026')
-    elif day_num:
+    elif extracted_date.isdigit():
+        day = int(extracted_date)
         try:
-            day = int(day_num)
-            month = reference_date.month
-            year = reference_date.year
-            
-            # Extract month from viewTitle
-            for name, m_val in MONTH_NAMES.items():
-                if name in view_title:
-                    month = m_val
-                    break
-            
-            # Extract year from viewTitle
-            yr_match = re.search(r'\b(202\d)\b', view_title)
-            if yr_match:
-                year = int(yr_match.group(1))
-
-            event_date = date(year, month, day)
+            event_date = date(current_year, current_month, day)
         except Exception:
-            event_date = reference_date
+            pass
 
-    # 2. Determine Start & End Times (e.g., '09:00 - 12:15')
+    # Resolve times
     time_search = f"{time_str} {full_text}"
     times = re.findall(r'(\d{1,2})[:h](\d{2})', time_search)
 
@@ -245,7 +273,6 @@ def parse_card_to_event(card, reference_date):
         start_dt = PARIS_TZ.localize(datetime.combine(event_date, time(9, 0)))
         end_dt = start_dt + timedelta(hours=2)
 
-    # 3. Description
     desc_lines = []
     if content:
         desc_lines.append(content)
@@ -254,7 +281,6 @@ def parse_card_to_event(card, reference_date):
     if room:
         desc_lines.append(f"Room: {room}")
 
-    # Unique UID based on Title, Start Time, and Room
     raw_uid = f"{title}_{start_dt.strftime('%Y%m%d%H%M')}_{room}"
     event_id = re.sub(r'[^a-zA-Z0-9]', '', raw_uid)[:64]
 
@@ -322,7 +348,7 @@ def sync_to_google(parsed_events):
             service.events().insert(calendarId=calendar_id, body=body).execute()
             print(f"[ADD] {body['summary']} ({item['start']['dateTime']}) - {body['location']}")
 
-    # Clean up obsolete placeholder events from previous buggy runs
+    # Remove events from previous test runs that don't match the actual schedule
     for auriga_id, g_event in existing_events.items():
         if auriga_id and auriga_id not in seen_ids:
             start_iso = g_event.get("start", {}).get("dateTime")
@@ -337,7 +363,6 @@ if __name__ == "__main__":
     today = date.today()
     parsed_events = []
     
-    # Process cards and prevent duplicates across overlapping views
     seen_events = set()
     for c in cards:
         if c.get("title") and len(c.get("title")) > 2:
