@@ -240,7 +240,7 @@ def sync_to_google(parsed_events):
                 service.events().patch(calendarId=calendar_id, eventId=curr["id"], body=body).execute()
                 print(f"[UPDATE] {body['summary']} ({item['start']['dateTime']})")
         else:
-            service.events().insert(calendarId=calendar_id, body=body=body).execute()
+            service.events().insert(calendarId=calendar_id, body=body).execute()
             print(f"[ADD] {body['summary']} ({item['start']['dateTime']}) - {body['location']}")
 
     # Clean up any misplaced events from earlier DOM test runs
