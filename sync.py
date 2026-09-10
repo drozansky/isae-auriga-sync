@@ -24,150 +24,155 @@ def fetch_auriga_schedule():
     username = os.environ["SCHOOL_USERNAME"]
     password = os.environ["SCHOOL_PASSWORD"]
     
-    events = []
+    extracted_events = []
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
+        # Set browser locale and Accept-Language to English
         context = browser.new_context(
-            locale="fr-FR", 
+            locale="en-US",
             timezone_id="Europe/Paris",
-            viewport={"width": 1600, "height": 1000}
+            viewport={"width": 1600, "height": 1000},
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
         )
         page = context.new_page()
 
-        # Log and inspect network traffic
+        # Listen for any background JSON payloads containing course data
         def handle_response(response):
-            url = response.url
-            # Filter out images, fonts, css
-            if any(ext in url for ext in [".css", ".png", ".jpg", ".woff", ".svg", ".ico"]):
+            if any(ext in response.url for ext in [".js", ".css", ".png", ".svg", ".woff"]):
                 return
-            
             try:
                 ct = response.headers.get("content-type", "")
-                if "json" in ct or "xml" in ct or "text" in ct:
-                    text = response.text()
-                    # Catch events JSON
-                    if '"events"' in text or '"start"' in text or 'events:' in text:
-                        print(f"[NET DEBUG] Candidate event response from: {url[:100]}")
-                        match = re.search(r'\{"events"\s*:\s*(\[.*?\])\}', text)
-                        if match:
-                            parsed = json.loads(match.group(1))
-                            events.extend(parsed)
-                            print(f"[INFO] Intercepted {len(parsed)} events via regex.")
-                        else:
-                            try:
-                                data = response.json()
-                                if isinstance(data, list) and len(data) > 0:
-                                    events.extend(data)
-                                    print(f"[INFO] Intercepted {len(data)} list items.")
-                                elif isinstance(data, dict):
-                                    for key in ["events", "data", "rows"]:
-                                        if key in data and isinstance(data[key], list):
-                                            events.extend(data[key])
-                                            print(f"[INFO] Intercepted {len(data[key])} items from dict key '{key}'.")
-                            except Exception:
-                                pass
+                if "json" in ct:
+                    data = response.json()
+                    # Check for lists of event objects
+                    target_list = None
+                    if isinstance(data, list) and len(data) > 0:
+                        target_list = data
+                    elif isinstance(data, dict):
+                        for k in ["events", "data", "planning", "items"]:
+                            if k in data and isinstance(data[k], list):
+                                target_list = data[k]
+                                break
+                    
+                    if target_list:
+                        for item in target_list:
+                            if isinstance(item, dict) and ("start" in item or "title" in item or "debut" in item):
+                                extracted_events.append(item)
+                                print(f"[NET] Extracted event from API: {item.get('title') or item.get('name')}")
             except Exception:
                 pass
 
         page.on("response", handle_response)
 
-        print("[INFO] Opening Auriga...")
+        print("[INFO] Navigating to Auriga...")
         page.goto("https://auriga.isae-supaero.fr", wait_until="networkidle")
 
-        # 1. Click SSO
+        # 1. Handle SSO
         sso_btn = page.locator("text=/Connexion SSO|SSO|Authentification/i").first
         if sso_btn.is_visible():
             sso_btn.click()
             page.wait_for_load_state("networkidle")
 
-        # 2. Fill Eliot login
+        # 2. Login via Eliot
         if "eliot.isae.fr" in page.url or page.locator("input[type='password']").count() > 0:
-            print("[INFO] Submitting Eliot credentials...")
+            print("[INFO] Authenticating via Eliot...")
             page.locator("input[type='text'], input[name*='username'], input[id*='username'], input[name='j_username']").first.fill(username)
             page.locator("input[type='password'], input[name='j_password']").first.fill(password)
             submit_btn = page.locator("button[type='submit'], input[type='submit'], button[name='_eventId_proceed']").first
             submit_btn.click()
             page.wait_for_load_state("networkidle")
 
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(3000)
 
-        # 3. Direct navigation to menuEntry 227
-        print(f"[INFO] Navigating to {PLANNING_URL}...")
+        # 3. Switch Language to English if toggle exists
+        try:
+            lang_btn = page.locator("button:has-text('EN'), a:has-text('EN'), [aria-label*='English'], [title*='English']").first
+            if lang_btn.is_visible():
+                print("[INFO] Switching interface language to English...")
+                lang_btn.click()
+                page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+        # 4. Open Planning view
+        print("[INFO] Opening Planning view...")
         page.goto(PLANNING_URL, wait_until="networkidle")
         page.wait_for_timeout(6000)
 
-        # 4. If network intercept caught 0 events, scrape the visible DOM calendar elements directly
-        if len(events) == 0:
-            print("[INFO] Interceptor caught 0 events. Checking DOM for rendered calendar cards...")
-            
-            # Common Auriga / FullCalendar event selectors
-            card_selectors = [
-                ".fc-event", 
-                ".ui-schedule-event", 
-                "div[class*='event-item']", 
-                "div[class*='planning-event']",
-                ".fc-time-grid-event",
-                ".fc-daygrid-event"
-            ]
-            
-            found_cards = []
-            for sel in card_selectors:
-                cards = page.locator(sel).all()
-                if len(cards) > 0:
-                    print(f"[INFO] Found {len(cards)} event elements matching selector '{sel}'.")
-                    found_cards = cards
-                    break
+        # 5. Extract colored event elements directly from the DOM
+        # Modern schedulers wrap colored cards in identifiable classes
+        print("[INFO] Scanning DOM for rendered colored boxes...")
+        cards = page.locator(
+            "[class*='event'], "
+            "[class*='fc-time-grid-event'], "
+            "[class*='planning-item'], "
+            "[class*='appointment'], "
+            "[style*='background-color']"
+        ).all()
 
-            for card in found_cards:
-                try:
-                    text_content = card.inner_text().strip()
-                    if text_content:
-                        events.append({
-                            "id": f"dom_{hash(text_content)}",
-                            "title": text_content,
-                            "raw_dom": True
-                        })
-                except Exception:
-                    pass
+        dom_items = []
+        for card in cards:
+            try:
+                # Filter out tiny elements or background containers
+                box = card.bounding_box()
+                if not box or box["width"] < 40 or box["height"] < 20:
+                    continue
+                
+                text = card.inner_text().strip()
+                if text and len(text) > 3 and not any(skip in text for skip in ["Mon planning", "Planning", "Aujourd'hui", "Today", "Semaine", "Week"]):
+                    dom_items.append({
+                        "raw_text": text,
+                        "title": text.split("\n")[0],
+                        "details": text.replace("\n", " - ")
+                    })
+            except Exception:
+                pass
+
+        print(f"[DOM] Located {len(dom_items)} visible schedule cards.")
+
+        # If API interception didn't yield structured JSON, use DOM card text
+        if len(extracted_events) == 0 and len(dom_items) > 0:
+            print("[INFO] Using DOM card content for calendar sync.")
+            for idx, item in enumerate(dom_items):
+                extracted_events.append({
+                    "id": f"card_{idx}_{hash(item['details'])}",
+                    "title": item["title"],
+                    "description": item["details"],
+                    "dom_card": True
+                })
 
         page.screenshot(path="debug_screen.png")
         browser.close()
 
-    # Deduplicate
-    unique = []
-    seen = set()
-    for e in events:
-        s = json.dumps(e, sort_keys=True)
-        if s not in seen:
-            seen.add(s)
-            unique.append(e)
-
-    return unique
+    return extracted_events
 
 def parse_event_details(raw_event):
-    # Handle standard PrimeFaces event object
-    title = raw_event.get("title", "Cours")
-    clean_title = re.sub(r"<br\s*/?>", " - ", str(title))
-    clean_title = re.sub(r"<.*?>", "", clean_title).strip()
+    title = raw_event.get("title", "Course")
+    desc = raw_event.get("description", raw_event.get("details", title))
+    clean_title = re.sub(r"<.*?>", "", str(title)).strip()
 
     start_raw = raw_event.get("start")
     end_raw = raw_event.get("end")
 
-    if not start_raw:
-        # If event came from fallback DOM parser without timestamp
-        now = datetime.now(PARIS_TZ)
-        start_dt = now
-        end_dt = now + timedelta(hours=1)
-    elif isinstance(start_raw, int) or (isinstance(start_raw, str) and start_raw.isdigit()):
-        start_dt = datetime.fromtimestamp(int(start_raw) / 1000, tz=PARIS_TZ)
-        end_dt = datetime.fromtimestamp(int(end_raw) / 1000, tz=PARIS_TZ) if end_raw else start_dt + timedelta(hours=2)
-    else:
-        start_dt = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00")).astimezone(PARIS_TZ)
-        end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00")).astimezone(PARIS_TZ) if end_raw else start_dt + timedelta(hours=2)
+    now = datetime.now(PARIS_TZ)
 
+    # Parse timestamps if present
+    if start_raw:
+        if isinstance(start_raw, int) or (isinstance(start_raw, str) and start_raw.isdigit()):
+            start_dt = datetime.fromtimestamp(int(start_raw) / 1000, tz=PARIS_TZ)
+            end_dt = datetime.fromtimestamp(int(end_raw) / 1000, tz=PARIS_TZ) if end_raw else start_dt + timedelta(hours=2)
+        else:
+            start_dt = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00")).astimezone(PARIS_TZ)
+            end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00")).astimezone(PARIS_TZ) if end_raw else start_dt + timedelta(hours=2)
+    else:
+        # Fallback for DOM cards without timestamps
+        start_dt = now
+        end_dt = now + timedelta(hours=2)
+
+    # Extract room number (Salle / Room / Amphi)
     location = ""
-    loc_match = re.search(r"(?:Salle|Amphi|Room)\s*[:\-]?\s*([A-Za-z0-9\.\-]+)", clean_title, re.IGNORECASE)
+    loc_match = re.search(r"(?:Room|Salle|Amphi)\s*[:\-]?\s*([A-Za-z0-9\.\-]+)", desc, re.IGNORECASE)
     if loc_match:
         location = loc_match.group(0)
 
@@ -175,8 +180,8 @@ def parse_event_details(raw_event):
 
     return {
         "id": event_id,
-        "summary": clean_title.split(" - ")[0] if " - " in clean_title else clean_title,
-        "description": clean_title,
+        "summary": clean_title,
+        "description": desc,
         "location": location,
         "start": {"dateTime": start_dt.isoformat()},
         "end": {"dateTime": end_dt.isoformat()},
@@ -190,7 +195,7 @@ def sync_to_google(parsed_events):
     time_min = (now - timedelta(days=7)).isoformat()
     time_max = (now + timedelta(days=60)).isoformat()
 
-    print("[INFO] Fetching existing calendar items from Google...")
+    print("[INFO] Fetching current Google Calendar events...")
     existing_call = service.events().list(
         calendarId=calendar_id,
         timeMin=time_min,
@@ -238,7 +243,7 @@ def sync_to_google(parsed_events):
 
 if __name__ == "__main__":
     raw = fetch_auriga_schedule()
-    print(f"[INFO] Retrieved {len(raw)} total events.")
+    print(f"[INFO] Retrieved {len(raw)} events.")
     if raw:
         formatted = [parse_event_details(e) for e in raw]
         sync_to_google(formatted)
