@@ -1,0 +1,33 @@
+name: Auriga Timetable Sync
+
+on:
+  schedule:
+    # Run every 2 hours from 06:00 to 20:00 UTC (08:00 to 22:00 CET/CEST), Monday to Friday
+    - cron: '0 6-20/2 * * 1-5'
+  workflow_dispatch: # Allows manual trigger anytime from GitHub UI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Run sync
+        run: python sync.py
+        env:
+          SCHOOL_USERNAME: ${{ secrets.SCHOOL_USERNAME }}
+          SCHOOL_PASSWORD: ${{ secrets.SCHOOL_PASSWORD }}
+          CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
