@@ -2,8 +2,8 @@ name: Auriga Timetable Sync
 
 on:
   schedule:
-    # Run every 2 hours from 06:00 to 20:00 UTC (08:00 to 22:00 CET), Monday to Friday
-    - cron: '0 6-20/2 * * 1-5'
+    # Runs every 2 hours from 06:00 to 16:00 UTC (08:00 to 18:00 Paris summer time), Mon-Fri
+    - cron: '0 6-16/2 * * 1-5'
   workflow_dispatch:
 
 jobs:
